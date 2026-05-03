@@ -37,6 +37,18 @@ enum Cmd {
     /// first viewer connects, and is torn down IDLE_TIMEOUT_SECONDS after the
     /// last viewer disconnects.
     Serve,
+    /// Tell the camera to reboot. Useful when the camera has degraded its
+    /// stream quality (e.g. dropped to 640x480@10fps after many reconnects).
+    /// The protobuf field number for `start_device_reboot` is not in any
+    /// captured HAR, so it has to be probed: try `--field 3`, `--field 4`,
+    /// etc. until the camera goes offline + comes back. Other observed
+    /// CameraTrigger field names are: get_snapshot, set_timelapse_enable,
+    /// snapshot_interval, send_camera_name.
+    RestartCamera {
+        /// CameraTrigger protobuf field number to set to 1.
+        #[arg(long, default_value_t = 3)]
+        field: u32,
+    },
 }
 
 #[tokio::main]
@@ -249,8 +261,80 @@ async fn main() -> anyhow::Result<()> {
                 .context("install ctrl+c handler")?;
             tracing::info!("ctrl+c received; shutting down");
         }
+        Cmd::RestartCamera { field } => {
+            let token = orch.access_token().await.context("acquire access token")?;
+            let printers = list_printers(&prusa, &endpoints.connect_base, &token)
+                .await
+                .context("list printers")?;
+            let printer = printers
+                .first()
+                .context("no printers visible to this account")?;
+            let cams = list_cameras(&prusa, &endpoints.connect_base, &token, &printer.uuid)
+                .await
+                .with_context(|| format!("list cameras for printer {}", printer.uuid))?;
+            let camera = cams
+                .first()
+                .context("no cameras visible on this printer")?
+                .clone();
+            tracing::info!(
+                camera.id = camera.id,
+                camera.name = camera.name.as_deref().unwrap_or("(unnamed)"),
+                field,
+                "sending restart trigger to camera"
+            );
+
+            let webrtc_cfg =
+                buddy3d_proxy::prusa::api::fetch_webrtc_config(&prusa, &token)
+                    .await
+                    .context("fetch webrtc config")?;
+            let signaling = PrusaSignaling::connect(
+                camera.token.clone(),
+                token.clone(),
+                webrtc_cfg.clone(),
+            )
+            .await
+            .context("connect signaling")?;
+
+            // Hand-encode a CameraTrigger: { camera_token: <token>, [field]: 1 }
+            // Field 11 (token) is known from observed wire frames. The action
+            // field number is what we're probing.
+            let payload = encode_camera_trigger(field, &camera.token);
+            tracing::info!(payload_len = payload.len(), "sending trigger");
+            signaling
+                .send_trigger(payload)
+                .await
+                .context("send trigger")?;
+
+            // Give the server a moment to deliver and the camera a moment to act.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            tracing::info!("restart trigger sent; camera should reboot in a few seconds");
+        }
     }
     Ok(())
+}
+
+/// Encode a `CameraTrigger` protobuf with `field_num: 1` and `token` at field 11.
+/// Wire format: each `<tag><value>` pair, where tag = (field_num << 3) | wire_type.
+/// uint32 is wire type 0 (varint), string is wire type 2 (LEN).
+fn encode_camera_trigger(field_num: u32, token: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(token.len() + 8);
+    // <field_num> uint32 = 1
+    let tag = (field_num << 3) | 0;
+    encode_varint(&mut buf, tag as u64);
+    encode_varint(&mut buf, 1); // value
+    // field 11 string = token
+    encode_varint(&mut buf, ((11u64) << 3) | 2);
+    encode_varint(&mut buf, token.len() as u64);
+    buf.extend_from_slice(token.as_bytes());
+    buf
+}
+
+fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buf.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
 }
 
 /// Lowercase, replace whitespace + non-alphanumerics with `-`, collapse runs.

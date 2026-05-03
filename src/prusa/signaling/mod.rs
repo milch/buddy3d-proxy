@@ -221,6 +221,20 @@ impl PrusaSignaling {
             .await
             .map_err(|_| SignalingError::SendClosed)
     }
+
+    /// Send a `trigger` event with a raw pre-encoded CameraTrigger payload.
+    /// Used by `restart-camera` (and any future ad-hoc trigger commands)
+    /// where the caller hand-encodes the proto.
+    pub async fn send_trigger(&self, payload: Vec<u8>) -> Result<(), SignalingError> {
+        self.outbound
+            .send(Outbound::BinaryEvent {
+                name: "trigger".into(),
+                payload: Bytes::from(payload),
+                expect_ack: false,
+            })
+            .await
+            .map_err(|_| SignalingError::SendClosed)
+    }
 }
 
 /// Convert a fetched `WebRtcConfig` (from REST) into the protobuf `IceConfig`

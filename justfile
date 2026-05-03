@@ -58,5 +58,12 @@ smoke-stream:
 serve:
     cargo run --bin buddy3d-proxy -- serve
 
+# Send a CameraTrigger reboot command to the camera. Useful after the camera
+# has degraded its stream quality from many reconnects. The protobuf field
+# number for start_device_reboot is unknown; default to 3 and probe.
+# Usage: just restart-camera [field=3]
+restart-camera field="3":
+    cargo run --bin buddy3d-proxy -- restart-camera --field {{field}}
+
 # Format + lint + test, in that order. Run before pushing.
 ci: fmt-check lint test

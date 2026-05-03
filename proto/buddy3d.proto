@@ -1,0 +1,220 @@
+// Prusa Buddy3D camera signaling protocol - reverse-engineered from wire format.
+// Captured from wss://camera-signaling.prusa3d.com via Engine.IO v4 / Socket.IO
+// binary attachments (opcode=2). Each Socket.IO event carries exactly one of
+// these messages as the binary attachment.
+//
+// Field numbers are authoritative (read from wire). Field *names* are
+// inferred from context; names marked "// observed: <hex>" are best-guess.
+// Submessages marked "opaque_*" have unclear internal structure and are kept
+// as bytes to be refined in a later plan iteration.
+
+syntax = "proto3";
+
+package buddy3d;
+
+// ── ClientAuthentication ──────────────────────────────────────────────────
+// Socket.IO event: "client_authentication"
+// Direction: client → server
+// Observed wire (1080 bytes):
+//   0a 14  [20-byte ASCII token]
+//   12 06  "client"
+//   1a 88 06  [JWT, ~1050 bytes]
+message ClientAuthentication {
+  string token       = 1;  // 20-char session token, e.g. "I47hvQfXx6SOPWD4bO00"
+  string client_kind = 2;  // literal "client" in observed captures
+  string access_jwt  = 3;  // Bearer JWT for Prusa Connect auth
+}
+
+// ── Trigger ───────────────────────────────────────────────────────────────
+// Socket.IO event: "trigger"
+// Direction: client → server
+// Two triggers are sent after client_authentication:
+//   Trigger 1: f1=1, f11=token   (hex prefix: 08 01 5a 14 ...)
+//   Trigger 2: f2=1, f11=token   (hex prefix: 10 01 5a 14 ...)
+// Semantic: likely a camera-stream or feature-poll request.
+message Trigger {
+  uint32 field1 = 1;   // observed: 1 in first trigger; 0 in second  // observed: 0x08 0x01
+  uint32 field2 = 2;   // observed: 0 in first trigger; 1 in second  // observed: 0x10 0x01
+  // fields 3-10 not observed
+  string token  = 11;  // 20-char session token (field tag 0x5a)
+}
+
+// ── IceServer ─────────────────────────────────────────────────────────────
+// Sub-message within IceServerGroup.
+// Observed in WebRtcSignal.ice_config:
+//   TURN example: f1=2, f2="coturn.prusa3d.com", f3=5349, f4=3
+//   STUN example: f1=1, f2="stun.l.google.com",  f3=5349
+message IceServer {
+  uint32 server_type = 1;  // 1=STUN, 2=TURN, 3=TURNS (observed: 1 and 2)
+  string host        = 2;
+  uint32 port        = 3;
+  uint32 transport   = 4;  // 1=UDP, 2=TCP, 3=TLS; absent for STUN entries
+}
+
+// ── IceServerGroup ────────────────────────────────────────────────────────
+// Groups TURN servers (with credentials) or STUN servers (no credentials).
+// Observed in WebRtcSignal f8 as repeated f1 submessages.
+message IceServerGroup {
+  repeated IceServer servers   = 1;
+  string             username   = 2;  // TURN username; absent for STUN groups
+  string             credential = 3;  // TURN password; absent for STUN groups
+}
+
+// ── IceConfig ─────────────────────────────────────────────────────────────
+// Top-level ICE configuration payload in the initial WebRtcSignal from server.
+// Observed as field 8 of WebRtcSignal (199 bytes).
+message IceConfig {
+  repeated IceServerGroup server_groups = 1;
+  uint32                  field2        = 2;  // observed: 1
+  uint32                  ttl_seconds   = 3;  // observed: 300
+}
+
+// ── SdpBody ───────────────────────────────────────────────────────────────
+// Wraps an SDP offer or answer string.
+// Observed as field 4 of WebRtcSignal when msg_type in {1,2,3}.
+message SdpBody {
+  string sdp = 1;   // full SDP text (RFC 4566)
+  string mid = 2;   // media stream id, e.g. "0"
+}
+
+// ── IceCandidateBody ──────────────────────────────────────────────────────
+// Wraps a single trickle-ICE candidate.
+// Observed as field 4 of WebRtcSignal when msg_type == 4.
+// f1 begins with "a=candidate:..." (RFC 5245 / RFC 8839 attribute line).
+message IceCandidateBody {
+  string candidate  = 1;  // "a=candidate:..." attribute line
+  string stream_id  = 2;  // media stream label, e.g. "video-stream"
+}
+
+// ── WebRtcSignal ──────────────────────────────────────────────────────────
+// Socket.IO event: "webrtc"
+// Direction: bidirectional
+//
+// Observed msg_type values:
+//   1 = SDP_OFFER (server → client, initial offer with ICE config in f8)
+//   2 = SDP_ANSWER (client → server or server → client)
+//   3 = SDP_OFFER (client → server)
+//   4 = ICE_CANDIDATE (trickle ICE, both directions)
+//
+// Observed direction values (f7):
+//   1 = originated by server / sent to client
+//   2 = originated by client / sent to server
+//
+// The body field (f4) varies by msg_type:
+//   msg_type 1,2,3 → body contains SDP text (SdpBody)
+//   msg_type 4     → body contains ICE candidate (IceCandidateBody)
+//   msg_type 1 also includes f8 (IceConfig)
+//
+// Because the body format is a tagged union, we store it as raw bytes here
+// so callers can decode based on msg_type. Typed accessors can be added
+// once the enum range is fully established.
+message WebRtcSignal {
+  string    token      = 1;  // 20-char session token
+  string    session_id = 2;  // Engine.IO session id of the *server* socket
+  string    peer_id    = 3;  // session id or features-hash depending on direction
+  bytes     body       = 4;  // SdpBody or IceCandidateBody encoded bytes
+  uint32    msg_type   = 5;  // see observed values above
+  // field 6 not observed
+  uint32    direction  = 7;  // 1=from_server, 2=from_client
+  IceConfig ice_config = 8;  // only present when msg_type == 1
+}
+
+// ── CameraIdentity ────────────────────────────────────────────────────────
+// Camera device identity data. Observed as Status.identity.field1.
+message CameraIdentity {
+  string camera_name = 1;  // user-visible name, e.g. "IoThinkIFeelSoGood"
+  string mac_address = 2;  // "A8:B5:8E:97:AC:01"
+  string ip_address  = 3;  // "10.99.50.34"
+  // field 4 not observed
+  uint32 field5      = 5;  // observed: 90 (decimal 'Z')
+}
+
+// ── CameraIdentityOuter ───────────────────────────────────────────────────
+// One layer of wrapping around CameraIdentity (Status.field4).
+message CameraIdentityOuter {
+  CameraIdentity identity = 1;
+}
+
+// ── SysInfo ───────────────────────────────────────────────────────────────
+// Runtime/system information. Observed as Status.field9 (57 bytes).
+message SysInfo {
+  fixed32 uptime_epoch    = 1;   // seconds since epoch (observed: i32 field)
+  uint64  uptime_seconds  = 2;   // raw uptime in seconds
+  string  uptime_human    = 3;   // "0 days, 5:3:38"
+  string  load_avg        = 4;   // "6.23,6.38,6.35,"
+  uint64  mem_total_kb    = 5;   // observed: 35151872
+  uint64  mem_free_kb     = 6;   // observed: 1617920
+  uint64  mem_available_kb= 7;   // observed: 167936
+  // field 8 not observed
+  uint32  cpu_temp_int    = 9;   // integer CPU temp (observed: 115 → probably 11.5°C or 115 = raw)
+}
+
+// ── StatusFlags ───────────────────────────────────────────────────────────
+// Small flag message. Observed as Status.field11 (2 bytes: 08 01).
+message StatusFlags {
+  uint32 field1 = 1;  // observed: 1
+}
+
+// ── CameraCapabilities ────────────────────────────────────────────────────
+// Camera firmware and capability details (Status.field5, 176 bytes).
+// Internal submessages still partially opaque; kept as bytes for now.
+message CameraCapabilities {
+  string fw_version   = 1;   // "3.1.4"
+  string hw_version   = 2;   // "NB.1.1.0"
+  string camera_name  = 3;   // "Buddy3D Camera"
+  bytes  opaque_f4    = 4;   // observed: varint(2), str("UNKNOWN") — profile/type flags
+  // field 5 not observed
+  bytes  opaque_f6    = 6;   // observed: varint(3), varint(2), str("rtsp://...") — stream config
+  bytes  opaque_f7    = 7;   // observed: varint(2) — flags
+  // field 8 not observed
+  bytes  opaque_f9    = 9;   // three strings: connect/signaling/ota hostnames
+}
+
+// ── Status ────────────────────────────────────────────────────────────────
+// Socket.IO event: "status"
+// Direction: server → client
+// Observed frame: 492 bytes
+//
+// Top-level field layout (verified from wire):
+//   f2  = opaque protocol config (13 bytes submsg)
+//   f3  = opaque flags (8 bytes submsg)
+//   f4  = CameraIdentityOuter (56 bytes)
+//   f5  = CameraCapabilities (176 bytes)
+//   f8  = token string
+//   f9  = SysInfo (57 bytes)
+//   f10 = camera_id string
+//   f11 = StatusFlags
+message Status {
+  // field 1 not observed
+  bytes                opaque_f2    = 2;   // protocol config blob (observed: 13 bytes)
+  bytes                opaque_f3    = 3;   // flags blob (observed: 8 bytes)
+  CameraIdentityOuter  identity     = 4;
+  CameraCapabilities   capabilities = 5;
+  // fields 6, 7 not observed
+  string               token        = 8;   // 20-char session token
+  SysInfo              sys_info     = 9;
+  string               camera_id    = 10;  // "SK1_Gy4shE_GJ7AbP8BS" — printer/camera serial?
+  StatusFlags          flags        = 11;
+}
+
+// ── Features ─────────────────────────────────────────────────────────────
+// Socket.IO event: "features"
+// Direction: server → client
+// Observed frame: 500 bytes
+//
+// Field layout (verified from wire):
+//   f2  = token
+//   f3  = fw_version
+//   f4  = hw_version
+//   f5  = schema_version ("4.4")
+//   f6  = features_json (JSON array of feature-name strings)
+//   f7  = features_hash (MD5 hex of features set?)
+message Features {
+  // field 1 not observed
+  string token          = 2;   // 20-char session token
+  string fw_version     = 3;   // "3.1.4"
+  string hw_version     = 4;   // "NB.1.1.0"
+  string schema_version = 5;   // "4.4"
+  string features_json  = 6;   // JSON-encoded array of feature-name strings
+  string features_hash  = 7;   // hex string, e.g. "cf9477d9e9568d62e75c265872c477c8"
+}

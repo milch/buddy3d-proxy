@@ -1,4 +1,6 @@
 set shell := ["bash", "-uc"]
+set dotenv-load := true
+set dotenv-required := false
 
 # List available recipes.
 default:

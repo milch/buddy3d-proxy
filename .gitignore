@@ -2,3 +2,5 @@ api/*.har
 PLAN.md
 docs/
 target/
+.env
+tokens.json

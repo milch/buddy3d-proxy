@@ -62,16 +62,43 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// Every env var Config reads. The fixture wipes all of these before each test so
+    /// `.env` files (loaded by `just dotenv-load`) or stale shell exports can't leak in.
+    const CONFIG_KEYS: &[&str] = &[
+        "PRUSA_EMAIL",
+        "PRUSA_PASSWORD",
+        "PRUSA_PRINTER_UUID",
+        "PRUSA_CAMERA_ID",
+        "RTSP_PORT",
+        "RTSP_PATH",
+        "RTSP_BIND_ADDR",
+        "IDLE_TIMEOUT_SECONDS",
+        "TOKEN_STORE_PATH",
+        "HEALTH_PORT",
+    ];
+
     fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-        // Serialize via a static mutex so tests don't race on env state.
+        // Serialize via a static mutex so tests don't race on env state. Recover from
+        // a poisoned lock so a panic in one test doesn't cascade-fail the others.
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK.lock().unwrap();
-        let saved: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var(k).ok())).collect();
-        for (k, v) in vars { std::env::set_var(k, v); }
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = CONFIG_KEYS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in CONFIG_KEYS {
+            std::env::remove_var(k);
+        }
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
         f();
         for (k, v) in saved {
-            match v { Some(val) => std::env::set_var(k, val), None => std::env::remove_var(k) }
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
         }
     }
 

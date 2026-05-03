@@ -8,9 +8,11 @@
 
 use crate::pkce::Pkce;
 use crate::prusa::client::{ClientError, PrusaClient};
-use crate::token_store::StoredTokens;
+use crate::token_store::{StoredTokens, TokenStore};
 use reqwest::{Method, Url};
 use serde::Deserialize;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub const CLIENT_ID: &str = "MRHTlZhZqkNrrQ6FUPtjyusAz8nc59ErHXP8XkS4";
 pub const REDIRECT_URI: &str = "https://connect.prusa3d.com/login/auth-callback";
@@ -142,6 +144,82 @@ pub async fn refresh(
         refresh_token: body.refresh_token,
         access_expires_at,
     })
+}
+
+pub struct AuthOrchestrator {
+    client: PrusaClient,
+    endpoints: AuthEndpoints,
+    store: TokenStore,
+    email: String,
+    password: String,
+    state: Mutex<Option<StoredTokens>>,
+}
+
+impl AuthOrchestrator {
+    pub fn new(
+        client: PrusaClient,
+        endpoints: AuthEndpoints,
+        store: TokenStore,
+        email: String,
+        password: String,
+    ) -> Self {
+        Self {
+            client,
+            endpoints,
+            store,
+            email,
+            password,
+            state: Mutex::new(None),
+        }
+    }
+
+    /// Returns a valid access token, performing refresh or full bootstrap as needed.
+    pub async fn access_token(self: &Arc<Self>) -> Result<String, AuthError> {
+        let mut state = self.state.lock().await;
+        if state.is_none() {
+            *state = self
+                .store
+                .load()
+                .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+        }
+
+        let needs_refresh = match state.as_ref() {
+            Some(t) => self.access_about_to_expire(t),
+            None => true,
+        };
+
+        if needs_refresh {
+            let new_tokens = match state.as_ref() {
+                Some(t) => match refresh(&self.client, &self.endpoints, &t.refresh_token).await {
+                    Ok(new) => new,
+                    Err(AuthError::Http(ClientError::Client(_))) => {
+                        tracing::warn!("refresh token rejected; falling back to bootstrap");
+                        bootstrap(&self.client, &self.endpoints, &self.email, &self.password)
+                            .await?
+                    }
+                    Err(e) => return Err(e),
+                },
+                None => {
+                    bootstrap(&self.client, &self.endpoints, &self.email, &self.password).await?
+                }
+            };
+            self.store
+                .save(&new_tokens)
+                .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+            *state = Some(new_tokens);
+        }
+
+        Ok(state.as_ref().unwrap().access_token.clone())
+    }
+
+    fn access_about_to_expire(&self, tokens: &StoredTokens) -> bool {
+        let now = std::time::SystemTime::now();
+        let exp = tokens.access_expires();
+        match exp.duration_since(now) {
+            Ok(remaining) => remaining < std::time::Duration::from_secs(60),
+            Err(_) => true, // already expired
+        }
+    }
 }
 
 fn extract_csrf(html: &str) -> Option<String> {
@@ -308,5 +386,81 @@ mod tests {
             .await;
         let err = refresh(&prusa, &endpoints, "bad").await.unwrap_err();
         assert!(matches!(err, AuthError::Http(ClientError::Client(_))));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_uses_persisted_token_when_fresh() {
+        let server = MockServer::start().await;
+        let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
+        let prusa = PrusaClient::new(reqwest::Client::new(), limiter);
+        let endpoints = AuthEndpoints {
+            account_base: server.uri().parse().unwrap(),
+            connect_base: server.uri().parse().unwrap(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json"));
+        // Persist a token that doesn't expire for a long time.
+        let exp = 9_999_999_999u64;
+        let access = mint_jwt(exp);
+        store
+            .save(&StoredTokens {
+                access_token: access.clone(),
+                refresh_token: mint_jwt(exp),
+                access_expires_at: exp,
+            })
+            .unwrap();
+
+        // No mocks configured — if the orchestrator tries to refresh, the test will fail.
+        let orch = Arc::new(AuthOrchestrator::new(
+            prusa,
+            endpoints,
+            store,
+            "u@e.com".into(),
+            "pw".into(),
+        ));
+        let got = orch.access_token().await.unwrap();
+        assert_eq!(got, access);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_refreshes_when_token_near_expiry() {
+        let server = MockServer::start().await;
+        let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
+        let prusa = PrusaClient::new(reqwest::Client::new(), limiter);
+        let endpoints = AuthEndpoints {
+            account_base: server.uri().parse().unwrap(),
+            connect_base: server.uri().parse().unwrap(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json"));
+        // Persist an already-expired token.
+        store
+            .save(&StoredTokens {
+                access_token: mint_jwt(1),
+                refresh_token: mint_jwt(9_999_999_999),
+                access_expires_at: 1,
+            })
+            .unwrap();
+
+        let new_exp = 9_999_999_998u64;
+        Mock::given(method("POST"))
+            .and(path("/o/token/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": mint_jwt(new_exp),
+                "refresh_token": mint_jwt(new_exp),
+            })))
+            .mount(&server)
+            .await;
+
+        let orch = Arc::new(AuthOrchestrator::new(
+            prusa,
+            endpoints,
+            store,
+            "u@e.com".into(),
+            "pw".into(),
+        ));
+        let _t = orch.access_token().await.unwrap();
+        let cached = orch.state.lock().await.as_ref().unwrap().access_expires_at;
+        assert_eq!(cached, new_exp);
     }
 }

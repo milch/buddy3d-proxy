@@ -23,8 +23,11 @@ pub enum AuthError {
     Http(#[from] ClientError),
     #[error("could not extract csrfmiddlewaretoken from login page")]
     NoCsrf,
-    #[error("login failed (likely wrong credentials, MFA enabled, or account locked)")]
-    LoginRejected,
+    #[error("login failed (status={status}, likely wrong credentials, MFA enabled, or account locked); body preview: {body_preview}")]
+    LoginRejected {
+        status: reqwest::StatusCode,
+        body_preview: String,
+    },
     #[error("login response did not include an auth code in the redirect chain")]
     NoAuthCode,
     #[error("token exchange returned malformed response: {0}")]
@@ -54,6 +57,13 @@ impl Default for AuthEndpoints {
     }
 }
 
+/// User-Agent used for `account.prusa3d.com` requests. Prusa fronts that domain with
+/// Cloudflare; the default `reqwest/...` UA gets challenged. Mimicking a current desktop
+/// Chrome avoids the JS-challenge path.
+const BROWSER_UA: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
+
 pub async fn bootstrap(
     client: &PrusaClient,
     endpoints: &AuthEndpoints,
@@ -61,33 +71,55 @@ pub async fn bootstrap(
     password: &str,
 ) -> Result<StoredTokens, AuthError> {
     let pkce = Pkce::generate();
-    let next_path = format!(
+
+    // Inner URL the user is being asked to log in for. Has its own redirect_uri
+    // value URL-encoded once already.
+    let inner_url = format!(
         "/o/authorize/?response_type=code&client_id={}&code_challenge_method=S256&code_challenge={}&redirect_uri={}",
         CLIENT_ID,
         pkce.challenge,
         urlencoding::encode(REDIRECT_URI),
     );
-    let login_url = endpoints.account_base.join(&format!("/login/?next={}", urlencoding::encode(&next_path)))
+    // Django's `next` validator treats `?` as a path terminator, so the entire inner
+    // URL has to be URL-encoded once before being passed as a `next` value — both in
+    // the GET URL's query string and in the POST form's `next` field. Reqwest's
+    // form encoder will add a second pass on top for the body.
+    let next_value = urlencoding::encode(&inner_url).into_owned();
+    let login_url = endpoints
+        .account_base
+        .join(&format!("/login/?next={next_value}"))
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+
+    // Single cookie-aware, non-auto-redirecting client used for the entire form-login
+    // chain. Sharing it across steps is essential: Django's CSRF check requires the
+    // `csrftoken` cookie set by the GET to be sent on the subsequent POST.
+    let chain_client = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(BROWSER_UA)
+        .build()
         .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
 
     // Step 1: GET the login page, extract csrfmiddlewaretoken.
-    let resp = client.send(client.request(Method::GET, login_url.clone())).await?;
-    let body = resp.text().await.map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+    let resp = chain_client
+        .get(login_url.clone())
+        .send()
+        .await
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
     let csrf = extract_csrf(&body).ok_or(AuthError::NoCsrf)?;
 
     // Step 2: POST credentials, intercept redirect chain to capture `code`.
     let form = [
         ("csrfmiddlewaretoken", csrf.as_str()),
-        ("next", next_path.as_str()),
+        ("next", next_value.as_str()),
         ("email", email),
         ("password", password),
     ];
-    let no_redirect_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .cookie_store(true)
-        .build()
-        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
-    let code = follow_chain_for_code(&no_redirect_client, login_url, &form).await?;
+    let code = follow_chain_for_code(&chain_client, login_url, &form).await?;
 
     // Step 3: exchange code for tokens.
     let token_url = endpoints.account_base.join("/o/token/")
@@ -235,23 +267,54 @@ async fn follow_chain_for_code(
     login_url: Url,
     form: &[(&str, &str)],
 ) -> Result<String, AuthError> {
+    // Django's CSRF middleware does strict Referer/Origin verification on HTTPS
+    // POSTs. Without these headers, every POST gets a 403 even with the correct
+    // csrfmiddlewaretoken value and matching csrftoken cookie.
+    let origin = format!(
+        "{}://{}",
+        login_url.scheme(),
+        login_url.host_str().unwrap_or("")
+    );
     let mut next_request: Option<reqwest::Request> = Some(
-        client.post(login_url).form(form).build().map_err(|e| AuthError::BadTokenResponse(e.to_string()))?,
+        client
+            .post(login_url.clone())
+            .header(reqwest::header::REFERER, login_url.as_str())
+            .header(reqwest::header::ORIGIN, origin)
+            .form(form)
+            .build()
+            .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?,
     );
     for _hop in 0..6 {
         let req = match next_request.take() { Some(r) => r, None => return Err(AuthError::NoAuthCode) };
         let resp = client.execute(req).await.map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
         if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
-            let url = resp.url().join(loc.to_str().unwrap_or_default())
+            let url = resp
+                .url()
+                .join(loc.to_str().unwrap_or_default())
                 .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
-            if let Some(code) = url.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string()) {
+            if let Some(code) = url
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v.to_string())
+            {
                 return Ok(code);
             }
-            next_request = Some(client.get(url).build().map_err(|e| AuthError::BadTokenResponse(e.to_string()))?);
+            next_request = Some(
+                client
+                    .get(url)
+                    .build()
+                    .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?,
+            );
             continue;
         }
         // No Location header and no code in URL: the login form was rejected.
-        return Err(AuthError::LoginRejected);
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let body_preview = body.chars().take(800).collect::<String>();
+        return Err(AuthError::LoginRejected {
+            status,
+            body_preview,
+        });
     }
     Err(AuthError::NoAuthCode)
 }
@@ -345,7 +408,7 @@ mod tests {
             .mount(&server).await;
 
         let err = bootstrap(&prusa, &endpoints, "u@e.com", "wrong").await.unwrap_err();
-        assert!(matches!(err, AuthError::LoginRejected));
+        assert!(matches!(err, AuthError::LoginRejected { .. }));
     }
 
     #[tokio::test]

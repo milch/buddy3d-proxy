@@ -35,6 +35,9 @@ base64 = "0.22"
 rand = "0.10"
 prost = "0.14"
 bytes = "1"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+webrtc = "0.8"
 
 [dev-dependencies]
 wiremock = "0.6"

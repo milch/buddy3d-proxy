@@ -235,6 +235,19 @@ impl PrusaSignaling {
             .await
             .map_err(|_| SignalingError::SendClosed)
     }
+
+    /// Send a `configuration` event with a raw pre-encoded Configuration payload.
+    /// Used by `set-quality` and other settings-mutation commands.
+    pub async fn send_configuration(&self, payload: Vec<u8>) -> Result<(), SignalingError> {
+        self.outbound
+            .send(Outbound::BinaryEvent {
+                name: "configuration".into(),
+                payload: Bytes::from(payload),
+                expect_ack: false,
+            })
+            .await
+            .map_err(|_| SignalingError::SendClosed)
+    }
 }
 
 /// Convert a fetched `WebRtcConfig` (from REST) into the protobuf `IceConfig`

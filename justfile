@@ -58,12 +58,16 @@ smoke-stream:
 serve:
     cargo run --bin buddy3d-proxy -- serve
 
-# Send a CameraTrigger reboot command to the camera. Useful after the camera
-# has degraded its stream quality from many reconnects. The protobuf field
-# number for start_device_reboot is unknown; default to 3 and probe.
-# Usage: just restart-camera [field=3]
-restart-camera field="3":
-    cargo run --bin buddy3d-proxy -- restart-camera --field {{field}}
+# Send a CameraTrigger reboot command (start_device_reboot=1).
+restart-camera:
+    cargo run --bin buddy3d-proxy -- restart-camera
+
+# Set the camera's video quality.
+# 1 = SD (640x480), 2 = HD (720p), 3 = FHD (1080p, default).
+# Use this to bring the camera back to 1080p after it auto-degrades.
+# Usage: just set-quality [quality=3]
+set-quality quality="3":
+    cargo run --bin buddy3d-proxy -- set-quality --quality {{quality}}
 
 # Format + lint + test, in that order. Run before pushing.
 ci: fmt-check lint test

@@ -3,6 +3,7 @@ pub mod jwt;
 pub mod pkce;
 pub mod proto;
 pub mod rate_limit;
+pub mod token_store;
 pub mod tracing_redact;
 
 pub fn init_tracing() {

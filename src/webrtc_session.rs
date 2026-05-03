@@ -132,6 +132,47 @@ impl WebRtcSession {
             })
         }));
 
+        // When the peer connection reaches Connected, log the selected ICE
+        // candidate pair so we can tell whether the media is going LAN-direct
+        // (host), via STUN-discovered public IPs (srflx), or relayed through
+        // a TURN server (relay). For Prusa Connect over the internet, we
+        // expect srflx in the common case and relay when symmetric NAT/CGNAT
+        // forces it. host means we're on the same LAN as the camera.
+        let pc_for_state = pc.clone();
+        pc.on_peer_connection_state_change(Box::new(move |state| {
+            let pc = pc_for_state.clone();
+            Box::pin(async move {
+                use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+                if state != RTCPeerConnectionState::Connected {
+                    return;
+                }
+                let pair = pc.sctp().transport().ice_transport().get_selected_candidate_pair().await;
+                if let Some(pair) = pair {
+                    let local_kind = describe_candidate_type(pair.local.typ);
+                    let remote_kind = describe_candidate_type(pair.remote.typ);
+                    let path = match (local_kind, remote_kind) {
+                        ("host", "host") => "LAN direct",
+                        ("relay", _) | (_, "relay") => "TURN relay",
+                        ("srflx", _) | (_, "srflx") => "STUN-aided direct (P2P over NAT)",
+                        ("prflx", _) | (_, "prflx") => "peer-reflexive direct",
+                        _ => "unknown",
+                    };
+                    tracing::info!(
+                        path = %path,
+                        local.kind = %local_kind,
+                        local.address = %pair.local.address,
+                        local.port = pair.local.port,
+                        remote.kind = %remote_kind,
+                        remote.address = %pair.remote.address,
+                        remote.port = pair.remote.port,
+                        "ice connected via {path}",
+                    );
+                } else {
+                    tracing::warn!("peer connected but no selected ice candidate pair");
+                }
+            })
+        }));
+
         // OnTrack: every RTP packet arriving on the negotiated track gets pushed.
         let rtp_tx_clone = rtp_tx.clone();
         pc.on_track(Box::new(move |track, _receiver, _transceiver| {
@@ -332,5 +373,18 @@ pub async fn run_session(
                 }
             }
         }
+    }
+}
+
+/// Map a webrtc-rs candidate type to the short ICE name (`host`, `srflx`,
+/// `prflx`, `relay`) that's well-known in WebRTC vocabulary.
+fn describe_candidate_type(t: webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType) -> &'static str {
+    use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
+    match t {
+        RTCIceCandidateType::Host => "host",
+        RTCIceCandidateType::Srflx => "srflx",
+        RTCIceCandidateType::Prflx => "prflx",
+        RTCIceCandidateType::Relay => "relay",
+        RTCIceCandidateType::Unspecified => "unknown",
     }
 }

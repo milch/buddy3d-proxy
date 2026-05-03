@@ -10,13 +10,31 @@ pub mod token_store;
 pub mod tracing_redact;
 pub mod webrtc_session;
 
+/// Initialize the tracing subscriber.
+///
+/// Auto-picks a format based on whether stdout is a TTY:
+/// - **TTY (interactive)**: pretty/compact human-readable lines with colors.
+/// - **Non-TTY (piped, redirected, Docker, systemd)**: structured JSON.
+///
+/// Override the level filter via `RUST_LOG`. Default is
+/// `info,buddy3d_proxy=debug`.
 pub fn init_tracing() {
-    use tracing_subscriber::{EnvFilter, fmt};
+    use std::io::IsTerminal;
+    use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,buddy3d_proxy=debug"));
-    fmt()
-        .json()
-        .with_env_filter(filter)
-        .with_target(true)
-        .init();
+    if std::io::stdout().is_terminal() {
+        fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .with_ansi(true)
+            .compact()
+            .init();
+    } else {
+        fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_target(true)
+            .init();
+    }
 }

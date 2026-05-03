@@ -5,6 +5,8 @@
 //! WebRTC bring-up is provided by an injected factory (`StreamFactory`) so
 //! tests can substitute a stub.
 
+pub mod webrtc_factory;
+
 use crate::rtsp::sdp::H264Params;
 use crate::rtsp::server::{SourceError, StreamSource, Subscription, ViewerEvent};
 use std::sync::atomic::{AtomicI32, Ordering};

@@ -35,7 +35,7 @@ pub enum SignalingError {
 /// Connected signaling session. Use `send_webrtc()` to push outbound signaling
 /// to the server, and the receiver to pull inbound events.
 pub struct PrusaSignaling {
-    outbound: mpsc::Sender<Outbound>,
+    pub(crate) outbound: mpsc::Sender<Outbound>,
     pub events: mpsc::Receiver<SignalingEvent>,
     /// The Socket.IO sid the server assigned when we connected. Callers need
     /// it to populate `WebRtcSignal.session_id` on outbound webrtc events

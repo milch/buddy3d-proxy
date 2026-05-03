@@ -7,6 +7,7 @@ use buddy3d_proxy::init_tracing;
 use buddy3d_proxy::prusa::api::{fetch_webrtc_config, list_cameras, list_printers};
 use buddy3d_proxy::prusa::auth::{AuthEndpoints, AuthOrchestrator};
 use buddy3d_proxy::prusa::client::PrusaClient;
+use buddy3d_proxy::prusa::commands::{encode_camera_trigger, encode_set_mode, encode_set_quality};
 use buddy3d_proxy::prusa::signaling::PrusaSignaling;
 use buddy3d_proxy::rate_limit::RateLimiter;
 use buddy3d_proxy::token_store::TokenStore;
@@ -439,72 +440,6 @@ where
     Ok(())
 }
 
-/// Encode a `Configuration` protobuf for SetMode (IR / day-night):
-///   field 3 (LEN, sub-message) = { field 4 (varint) = mode }
-///   field 6 (LEN, string)      = camera_token
-/// Matches the wire shape in api/2025-05-03 14-10.har:
-///   `1a 02 20 N 32 14 [token]`
-fn encode_set_mode(mode: u32, token: &str) -> Vec<u8> {
-    let mut sub = Vec::with_capacity(4);
-    encode_varint(&mut sub, ((4u64) << 3) | 0); // field 4, varint
-    encode_varint(&mut sub, mode as u64);
-
-    let mut buf = Vec::with_capacity(sub.len() + token.len() + 6);
-    encode_varint(&mut buf, ((3u64) << 3) | 2); // field 3, LEN
-    encode_varint(&mut buf, sub.len() as u64);
-    buf.extend_from_slice(&sub);
-    encode_varint(&mut buf, ((6u64) << 3) | 2); // field 6, LEN
-    encode_varint(&mut buf, token.len() as u64);
-    buf.extend_from_slice(token.as_bytes());
-    buf
-}
-
-/// Encode a `Configuration` protobuf for SetQuality (video resolution):
-///   field 4 (LEN, bytes)       = empty
-///   field 6 (LEN, string)      = camera_token
-///   field 8 (LEN, sub-message) = { field 1 (varint) = quality }
-/// Matches the wire shape in the user-pasted resolution-change session:
-///   `22 00 32 14 [token] 42 02 08 N`
-fn encode_set_quality(quality: u32, token: &str) -> Vec<u8> {
-    let mut sub = Vec::with_capacity(4);
-    encode_varint(&mut sub, ((1u64) << 3) | 0); // field 1, varint
-    encode_varint(&mut sub, quality as u64);
-
-    let mut buf = Vec::with_capacity(sub.len() + token.len() + 6);
-    encode_varint(&mut buf, ((4u64) << 3) | 2); // field 4, LEN
-    encode_varint(&mut buf, 0); // empty bytes
-    encode_varint(&mut buf, ((6u64) << 3) | 2); // field 6, LEN
-    encode_varint(&mut buf, token.len() as u64);
-    buf.extend_from_slice(token.as_bytes());
-    encode_varint(&mut buf, ((8u64) << 3) | 2); // field 8, LEN
-    encode_varint(&mut buf, sub.len() as u64);
-    buf.extend_from_slice(&sub);
-    buf
-}
-
-/// Encode a `CameraTrigger` protobuf with `field_num: 1` and `token` at field 11.
-/// Wire format: each `<tag><value>` pair, where tag = (field_num << 3) | wire_type.
-/// uint32 is wire type 0 (varint), string is wire type 2 (LEN).
-fn encode_camera_trigger(field_num: u32, token: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(token.len() + 8);
-    // <field_num> uint32 = 1
-    let tag = (field_num << 3) | 0;
-    encode_varint(&mut buf, tag as u64);
-    encode_varint(&mut buf, 1); // value
-    // field 11 string = token
-    encode_varint(&mut buf, ((11u64) << 3) | 2);
-    encode_varint(&mut buf, token.len() as u64);
-    buf.extend_from_slice(token.as_bytes());
-    buf
-}
-
-fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
-    while value >= 0x80 {
-        buf.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    buf.push(value as u8);
-}
 
 /// Lowercase, replace whitespace + non-alphanumerics with `-`, collapse runs.
 fn slugify(name: &str) -> String {

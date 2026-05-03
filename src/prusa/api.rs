@@ -55,6 +55,55 @@ pub async fn list_cameras(
     Ok(env.cameras)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebRtcConfig {
+    /// Short-lived token to send as `ClientAuthentication.token` to the signaling server.
+    pub token: String,
+    /// ICE servers (STUN/TURN) for the PeerConnection. Field name varies — Prusa
+    /// might use `ice_servers`, `iceServers`, or `webrtc_config.ice_servers`.
+    #[serde(default, alias = "iceServers", alias = "ice_servers")]
+    pub ice_servers: Vec<IceServerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IceServerConfig {
+    /// Single URL or list of URLs for this server entry.
+    #[serde(alias = "urls", alias = "url")]
+    pub urls: serde_json::Value,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default, alias = "credential")]
+    pub credential: Option<String>,
+}
+
+impl IceServerConfig {
+    /// Normalize `urls` (which can be a string or an array) into a flat Vec<String>.
+    pub fn url_list(&self) -> Vec<String> {
+        match &self.urls {
+            serde_json::Value::String(s) => vec![s.clone()],
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => vec![],
+        }
+    }
+}
+
+pub async fn fetch_webrtc_config(
+    client: &PrusaClient,
+    bearer: &str,
+) -> Result<WebRtcConfig, ClientError> {
+    let url: Url = "https://camera-service-api.prusa3d.com/v1/camera-webrtc-config"
+        .parse()
+        .expect("hardcoded url is valid");
+    let resp = client
+        .send(client.request(Method::GET, url).bearer_auth(bearer))
+        .await?;
+    let cfg: WebRtcConfig = resp.json().await.map_err(ClientError::Network)?;
+    Ok(cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +153,50 @@ mod tests {
             .unwrap();
         assert_eq!(cameras.len(), 1);
         assert_eq!(cameras[0].id, 380125);
+    }
+
+    #[tokio::test]
+    async fn webrtc_config_parses_string_and_array_urls() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/camera-webrtc-config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "WEBRTC-TOKEN",
+                "ice_servers": [
+                    {"urls": "stun:stun.prusa3d.com:3478"},
+                    {"urls": ["turn:turn.prusa3d.com:5349"], "username": "u", "credential": "p"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        // The function has a hardcoded production URL, so call the mock URL
+        // directly via reqwest and exercise the WebRtcConfig deserializer.
+        let resp_body: WebRtcConfig =
+            reqwest::get(format!("{}/v1/camera-webrtc-config", server.uri()))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(resp_body.token, "WEBRTC-TOKEN");
+        assert_eq!(resp_body.ice_servers.len(), 2);
+        assert_eq!(
+            resp_body.ice_servers[0].url_list(),
+            vec!["stun:stun.prusa3d.com:3478"]
+        );
+        assert_eq!(
+            resp_body.ice_servers[1].url_list(),
+            vec!["turn:turn.prusa3d.com:5349"]
+        );
+        assert_eq!(resp_body.ice_servers[1].username.as_deref(), Some("u"));
+        assert_eq!(resp_body.ice_servers[1].credential.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn ice_server_config_handles_unknown_url_shape() {
+        let cfg: IceServerConfig = serde_json::from_value(serde_json::json!({
+            "urls": 42
+        })).unwrap();
+        assert!(cfg.url_list().is_empty());
     }
 }

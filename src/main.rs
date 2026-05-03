@@ -50,12 +50,19 @@ enum Cmd {
         #[arg(long, default_value_t = 9)]
         field: u32,
     },
-    /// Set the camera's video quality. Reverses the auto-degradation that
-    /// happens after many WebRTC reconnects (camera drops to 640x480@10fps).
-    /// Sends a Configuration event with field 3 = {field 4 = quality} and
-    /// field 6 = camera_token (confirmed via api/2025-05-03 14-10.har).
+    /// Set the camera's IR / day-night mode.
+    /// Configuration field 3 = { field 4 = mode } from api/2025-05-03 14-10.har.
+    SetMode {
+        /// 1 = Auto (default), 2 = Day, 3 = Night.
+        #[arg(long, default_value_t = 1)]
+        mode: u32,
+    },
+    /// Set the camera's video resolution. Reverses the auto-degradation
+    /// that happens after many WebRTC reconnects (camera drops to a low
+    /// resolution / framerate). Configuration field 8 = { field 1 = N }
+    /// from a separate HAR pasted by the user.
     SetQuality {
-        /// 1 = SD (640x480), 2 = HD (720p), 3 = FHD (1080p, default).
+        /// 1 = SD, 2 = HD, 3 = FHD (1080p, default).
         #[arg(long, default_value_t = 3)]
         quality: u32,
     },
@@ -319,87 +326,128 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(Duration::from_secs(2)).await;
             tracing::info!("restart trigger sent; camera should reboot in a few seconds");
         }
+        Cmd::SetMode { mode } => {
+            anyhow::ensure!(
+                (1..=3).contains(&mode),
+                "mode must be 1 (Auto), 2 (Day), or 3 (Night)"
+            );
+            let label = match mode {
+                1 => "Auto",
+                2 => "Day",
+                3 => "Night",
+                _ => "?",
+            };
+            send_camera_configuration(
+                &orch,
+                &prusa,
+                &endpoints,
+                "setting camera IR mode",
+                ("mode", mode, label),
+                |token| encode_set_mode(mode, token),
+            )
+            .await?;
+        }
         Cmd::SetQuality { quality } => {
             anyhow::ensure!(
                 (1..=3).contains(&quality),
                 "quality must be 1 (SD), 2 (HD), or 3 (FHD)"
             );
-
-            let token = orch.access_token().await.context("acquire access token")?;
-            let printers = list_printers(&prusa, &endpoints.connect_base, &token)
-                .await
-                .context("list printers")?;
-            let printer = printers
-                .first()
-                .context("no printers visible to this account")?;
-            let cams = list_cameras(&prusa, &endpoints.connect_base, &token, &printer.uuid)
-                .await
-                .with_context(|| format!("list cameras for printer {}", printer.uuid))?;
-            let camera = cams
-                .first()
-                .context("no cameras visible on this printer")?
-                .clone();
-            tracing::info!(
-                camera.id = camera.id,
-                quality,
-                quality.label = match quality {
-                    1 => "SD",
-                    2 => "HD",
-                    3 => "FHD",
-                    _ => "?",
-                },
-                "setting camera video quality"
-            );
-
-            let webrtc_cfg =
-                buddy3d_proxy::prusa::api::fetch_webrtc_config(&prusa, &token)
-                    .await
-                    .context("fetch webrtc config")?;
-            let signaling = PrusaSignaling::connect(
-                camera.token.clone(),
-                token.clone(),
-                webrtc_cfg.clone(),
+            let label = match quality {
+                1 => "SD",
+                2 => "HD",
+                3 => "FHD",
+                _ => "?",
+            };
+            send_camera_configuration(
+                &orch,
+                &prusa,
+                &endpoints,
+                "setting camera video resolution",
+                ("quality", quality, label),
+                |token| encode_set_quality(quality, token),
             )
-            .await
-            .context("connect signaling")?;
-
-            // Configuration changes require an active "viewer" session. The
-            // browser captures this by completing the WebRTC handshake +
-            // sending a trigger field 3 ("subscribe to settings") before
-            // emitting any configuration event. Without this, the server
-            // returns "Client does not have permission to use the camera"
-            // and disconnects. We wait for the auto-kickoff WebRTC to settle
-            // (~6s in practice), then send field-3 trigger, then the config.
-            tokio::time::sleep(Duration::from_secs(6)).await;
-            let trigger3 = encode_camera_trigger(3, &camera.token);
-            signaling
-                .send_trigger(trigger3)
-                .await
-                .context("send field-3 trigger")?;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
-            let payload = encode_set_quality(quality, &camera.token);
-            signaling
-                .send_configuration(payload)
-                .await
-                .context("send configuration")?;
-
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            tracing::info!("quality configuration sent; new resolution should apply on next stream");
+            .await?;
         }
     }
     Ok(())
 }
 
-/// Encode a `Configuration` protobuf for SetQuality:
-///   field 3 (LEN, sub-message) = { field 4 (varint) = quality }
+/// Common boilerplate for any setting-mutation: discover the camera, connect
+/// via PrusaSignaling, wait for WebRTC to settle (so the server treats us
+/// as an authorized viewer), send a trigger-field-3 ("subscribe to settings"),
+/// then send the caller's pre-encoded Configuration payload.
+async fn send_camera_configuration<F>(
+    orch: &Arc<AuthOrchestrator>,
+    prusa: &PrusaClient,
+    endpoints: &AuthEndpoints,
+    log_msg: &str,
+    (key, value, label): (&'static str, u32, &str),
+    payload_for: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&str) -> Vec<u8>,
+{
+    let token = orch.access_token().await.context("acquire access token")?;
+    let printers = list_printers(prusa, &endpoints.connect_base, &token)
+        .await
+        .context("list printers")?;
+    let printer = printers
+        .first()
+        .context("no printers visible to this account")?;
+    let cams = list_cameras(prusa, &endpoints.connect_base, &token, &printer.uuid)
+        .await
+        .with_context(|| format!("list cameras for printer {}", printer.uuid))?;
+    let camera = cams
+        .first()
+        .context("no cameras visible on this printer")?
+        .clone();
+    tracing::info!(
+        camera.id = camera.id,
+        "{key}" = value,
+        "{key}.label" = label,
+        "{log_msg}"
+    );
+
+    let webrtc_cfg = buddy3d_proxy::prusa::api::fetch_webrtc_config(prusa, &token)
+        .await
+        .context("fetch webrtc config")?;
+    let signaling =
+        PrusaSignaling::connect(camera.token.clone(), token.clone(), webrtc_cfg.clone())
+            .await
+            .context("connect signaling")?;
+
+    // Configuration changes require an active "viewer" session. The browser
+    // sends a trigger field 3 (likely "subscribe to settings") after the
+    // WebRTC handshake completes, before emitting any configuration event.
+    // Without this the server returns "Client does not have permission".
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let trigger3 = encode_camera_trigger(3, &camera.token);
+    signaling
+        .send_trigger(trigger3)
+        .await
+        .context("send field-3 trigger")?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payload = payload_for(&camera.token);
+    signaling
+        .send_configuration(payload)
+        .await
+        .context("send configuration")?;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    tracing::info!("configuration sent; new {key} should apply on next stream");
+    Ok(())
+}
+
+/// Encode a `Configuration` protobuf for SetMode (IR / day-night):
+///   field 3 (LEN, sub-message) = { field 4 (varint) = mode }
 ///   field 6 (LEN, string)      = camera_token
 /// Matches the wire shape in api/2025-05-03 14-10.har:
 ///   `1a 02 20 N 32 14 [token]`
-fn encode_set_quality(quality: u32, token: &str) -> Vec<u8> {
+fn encode_set_mode(mode: u32, token: &str) -> Vec<u8> {
     let mut sub = Vec::with_capacity(4);
     encode_varint(&mut sub, ((4u64) << 3) | 0); // field 4, varint
-    encode_varint(&mut sub, quality as u64);
+    encode_varint(&mut sub, mode as u64);
 
     let mut buf = Vec::with_capacity(sub.len() + token.len() + 6);
     encode_varint(&mut buf, ((3u64) << 3) | 2); // field 3, LEN
@@ -408,6 +456,29 @@ fn encode_set_quality(quality: u32, token: &str) -> Vec<u8> {
     encode_varint(&mut buf, ((6u64) << 3) | 2); // field 6, LEN
     encode_varint(&mut buf, token.len() as u64);
     buf.extend_from_slice(token.as_bytes());
+    buf
+}
+
+/// Encode a `Configuration` protobuf for SetQuality (video resolution):
+///   field 4 (LEN, bytes)       = empty
+///   field 6 (LEN, string)      = camera_token
+///   field 8 (LEN, sub-message) = { field 1 (varint) = quality }
+/// Matches the wire shape in the user-pasted resolution-change session:
+///   `22 00 32 14 [token] 42 02 08 N`
+fn encode_set_quality(quality: u32, token: &str) -> Vec<u8> {
+    let mut sub = Vec::with_capacity(4);
+    encode_varint(&mut sub, ((1u64) << 3) | 0); // field 1, varint
+    encode_varint(&mut sub, quality as u64);
+
+    let mut buf = Vec::with_capacity(sub.len() + token.len() + 6);
+    encode_varint(&mut buf, ((4u64) << 3) | 2); // field 4, LEN
+    encode_varint(&mut buf, 0); // empty bytes
+    encode_varint(&mut buf, ((6u64) << 3) | 2); // field 6, LEN
+    encode_varint(&mut buf, token.len() as u64);
+    buf.extend_from_slice(token.as_bytes());
+    encode_varint(&mut buf, ((8u64) << 3) | 2); // field 8, LEN
+    encode_varint(&mut buf, sub.len() as u64);
+    buf.extend_from_slice(&sub);
     buf
 }
 

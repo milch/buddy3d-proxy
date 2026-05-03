@@ -62,12 +62,18 @@ serve:
 restart-camera:
     cargo run --bin buddy3d-proxy -- restart-camera
 
-# Set the camera's video quality.
-# 1 = SD (640x480), 2 = HD (720p), 3 = FHD (1080p, default).
+# Set the camera's video resolution.
+# 1 = SD, 2 = HD, 3 = FHD (1080p, default).
 # Use this to bring the camera back to 1080p after it auto-degrades.
 # Usage: just set-quality [quality=3]
 set-quality quality="3":
     cargo run --bin buddy3d-proxy -- set-quality --quality {{quality}}
+
+# Set the camera's IR / day-night mode.
+# 1 = Auto (default), 2 = Day, 3 = Night.
+# Usage: just set-mode [mode=1]
+set-mode mode="1":
+    cargo run --bin buddy3d-proxy -- set-mode --mode {{mode}}
 
 # Format + lint + test, in that order. Run before pushing.
 ci: fmt-check lint test

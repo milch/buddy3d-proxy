@@ -5,6 +5,7 @@
 //! received RTP packets onto `rtp_tx` for downstream consumption.
 
 use crate::prusa::api::WebRtcConfig;
+use crate::prusa::signaling::{PrusaSignaling, SignalingEvent};
 use crate::proto;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -231,5 +232,47 @@ mod tests {
         let body = proto::IceCandidateBody::decode(buf.as_slice()).unwrap();
         assert!(body.candidate.starts_with("a=candidate:"));
         assert_eq!(body.stream_id, "0");
+    }
+}
+
+/// Top-level session driver: takes an authenticated PrusaSignaling and a
+/// WebRtcSession, and pumps signaling events into the WebRTC session and
+/// outbound signals back out, until something closes.
+pub async fn run_session(
+    mut signaling: PrusaSignaling,
+    session: &WebRtcSession,
+    outbound_signal_tx: mpsc::Sender<proto::WebRtcSignal>,
+    mut outbound_signal_rx: mpsc::Receiver<proto::WebRtcSignal>,
+) {
+    loop {
+        tokio::select! {
+            ev = signaling.events.recv() => {
+                match ev {
+                    Some(SignalingEvent::WebRtc(signal)) => {
+                        if let Err(e) = session.handle_signal(&signal, &outbound_signal_tx).await {
+                            tracing::warn!(error = %e, "handle_signal failed");
+                        }
+                    }
+                    Some(SignalingEvent::Status(_)) | Some(SignalingEvent::Features(_)) => {
+                        // Informational; we don't need to act on these for streaming.
+                    }
+                    Some(SignalingEvent::Unknown { name, .. }) => {
+                        tracing::debug!(event = %name, "unhandled signaling event");
+                    }
+                    Some(SignalingEvent::Closed(reason)) => {
+                        tracing::info!(reason = %reason, "signaling closed");
+                        return;
+                    }
+                    None => return,
+                }
+            }
+            out = outbound_signal_rx.recv() => {
+                let Some(out) = out else { return };
+                if let Err(e) = signaling.send_webrtc(out).await {
+                    tracing::warn!(error = %e, "send_webrtc failed");
+                    return;
+                }
+            }
+        }
     }
 }

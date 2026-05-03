@@ -107,19 +107,38 @@ async fn real_prusa_stream_smoke() {
     ));
 
     let token = orch.access_token().await.expect("access token");
+
+    use buddy3d_proxy::prusa::api::{list_cameras, list_printers};
+    let printers = list_printers(&prusa, &endpoints.connect_base, &token)
+        .await
+        .expect("printers");
+    let printer = printers.first().expect("at least one printer");
+    let cams = list_cameras(&prusa, &endpoints.connect_base, &token, &printer.uuid)
+        .await
+        .expect("cameras");
+    let camera = cams.first().expect("at least one camera");
+
     let webrtc_cfg = fetch_webrtc_config(&prusa, &token)
         .await
         .expect("webrtc config");
-    let signaling = PrusaSignaling::connect(token.clone())
-        .await
-        .expect("signaling");
+    let signaling =
+        PrusaSignaling::connect(camera.token.clone(), token.clone(), webrtc_cfg.clone())
+            .await
+            .expect("signaling");
 
     let (signal_tx, signal_rx) = mpsc::channel(32);
     let (rtp_tx, mut rtp_rx) = mpsc::channel(1024);
+    let sid = signaling.session_id.clone();
     let session = Arc::new(
-        WebRtcSession::new(&webrtc_cfg, signal_tx.clone(), rtp_tx)
-            .await
-            .expect("session"),
+        WebRtcSession::new(
+            &webrtc_cfg,
+            camera.token.clone(),
+            sid,
+            signal_tx.clone(),
+            rtp_tx,
+        )
+        .await
+        .expect("session"),
     );
 
     let driver_session = session.clone();

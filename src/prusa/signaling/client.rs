@@ -15,17 +15,31 @@ pub enum Outbound {
     /// CONNECT with auth payload.
     Connect(serde_json::Value),
     /// EVENT with one binary attachment (the protobuf-encoded payload).
-    BinaryEvent { name: String, payload: Bytes },
+    /// `expect_ack` controls whether the Socket.IO frame carries an ack_id —
+    /// only `client_authentication` does in Prusa's protocol; other events
+    /// (trigger, webrtc) get rejected with a session-member error if we
+    /// include one.
+    BinaryEvent {
+        name: String,
+        payload: Bytes,
+        expect_ack: bool,
+    },
 }
 
 /// Inbound events from the server, after Correlator assembly.
 #[derive(Debug, Clone)]
 pub enum Inbound {
-    Connected,
+    /// The Socket.IO server acknowledged our CONNECT and assigned a `sid`.
+    /// We need this sid to populate `WebRtcSignal.session_id` on the kick-off.
+    Connected { sid: Option<String> },
     Disconnected,
     /// Server sent a binary event with attachments. We deliver a single attachment
     /// because every observed Prusa event uses exactly one.
     BinaryEvent { name: String, payload: Bytes },
+    /// Server ACK'd one of our `emitWithAck` events. Used to gate follow-up
+    /// emits until the auth flow is complete (otherwise the server returns
+    /// `ClientIsNotSessionMemberError` for any event that races the auth ACK).
+    Ack { id: u64, payload: Vec<serde_json::Value> },
     /// Underlying transport closed unexpectedly.
     TransportClosed(String),
 }
@@ -106,6 +120,7 @@ pub async fn connect(
         let mut ping_timer = tokio::time::interval(ping_interval + Duration::from_secs(5));
         // First tick fires immediately; skip it.
         ping_timer.tick().await;
+        let mut next_ack_id: u64 = 0;
 
         loop {
             tokio::select! {
@@ -122,6 +137,7 @@ pub async fn connect(
                         Some(Ok(Message::Text(t))) => {
                             // We received traffic — reset the watchdog.
                             ping_timer.reset();
+                            tracing::debug!(frame = %t.as_str(), "ws recv text");
                             match engineio::parse_text(t.as_str()) {
                                 Ok(engineio::TextPacket::Ping) => {
                                     if sink.send(Message::Text(engineio::encode_pong().into())).await.is_err() {
@@ -131,11 +147,19 @@ pub async fn connect(
                                 }
                                 Ok(engineio::TextPacket::Message(payload)) => {
                                     match correlator.feed_text(&payload) {
-                                        Ok(Some(socketio::Event::Connected { .. })) => {
-                                            let _ = inbound_tx.send(Inbound::Connected).await;
+                                        Ok(Some(socketio::Event::Connected { auth })) => {
+                                            let sid = auth
+                                                .as_ref()
+                                                .and_then(|v| v.get("sid"))
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string());
+                                            let _ = inbound_tx.send(Inbound::Connected { sid }).await;
                                         }
                                         Ok(Some(socketio::Event::Disconnected)) => {
                                             let _ = inbound_tx.send(Inbound::Disconnected).await;
+                                        }
+                                        Ok(Some(socketio::Event::Ack { id, args })) => {
+                                            let _ = inbound_tx.send(Inbound::Ack { id, payload: args }).await;
                                         }
                                         Ok(Some(socketio::Event::Binary { name, attachments })) => {
                                             let payload = attachments.into_iter().next().unwrap_or_default();
@@ -184,12 +208,31 @@ pub async fn connect(
                     let frames = match out {
                         Outbound::Connect(auth) => {
                             let body = socketio::encode_connect(&auth);
-                            vec![Message::Text(engineio::encode_message(&body).into())]
+                            let text = engineio::encode_message(&body);
+                            tracing::debug!(frame = %text, "ws send text (connect)");
+                            vec![Message::Text(text.into())]
                         }
-                        Outbound::BinaryEvent { name, payload } => {
-                            let header = socketio::encode_binary_event(&name, 1);
+                        Outbound::BinaryEvent {
+                            name,
+                            payload,
+                            expect_ack,
+                        } => {
+                            let ack_id = if expect_ack {
+                                let id = next_ack_id;
+                                next_ack_id += 1;
+                                Some(id)
+                            } else {
+                                None
+                            };
+                            let header = socketio::encode_binary_event(&name, 1, ack_id);
+                            let text = engineio::encode_message(&header);
+                            tracing::debug!(
+                                frame = %text,
+                                bin_len = payload.len(),
+                                "ws send binary event"
+                            );
                             vec![
-                                Message::Text(engineio::encode_message(&header).into()),
+                                Message::Text(text.into()),
                                 Message::Binary(payload.into()),
                             ]
                         }

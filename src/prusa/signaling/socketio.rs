@@ -138,17 +138,26 @@ pub fn encode_connect(auth: &serde_json::Value) -> String {
     format!("0{auth}")
 }
 
-/// Encodes an EVENT (`5N-[...]`) with N binary attachments referenced as
-/// `_placeholder:true, num:i`. Returns the text packet body (caller must
+/// Encodes an EVENT (`5N-[<ack_id>][...]`) with N binary attachments referenced
+/// as `_placeholder:true, num:i`. Returns the text packet body (caller must
 /// then send the binary attachments in order).
-pub fn encode_binary_event(name: &str, attachment_count: u32) -> String {
+///
+/// `ack_id` should be `Some(id)` for events the JS client emits via
+/// `emitWithAck()` (only `client_authentication` in the captured HAR), and
+/// `None` for plain `emit()` events (`trigger`, `webrtc`, `configuration`).
+/// Including an ack_id on a non-ack event triggers
+/// `ClientIsNotSessionMemberError` on the Prusa signaling server.
+pub fn encode_binary_event(name: &str, attachment_count: u32, ack_id: Option<u64>) -> String {
     let mut placeholders: Vec<serde_json::Value> = (0..attachment_count)
         .map(|i| serde_json::json!({"_placeholder": true, "num": i}))
         .collect();
     let mut args: Vec<serde_json::Value> = vec![serde_json::Value::String(name.to_string())];
     args.append(&mut placeholders);
     let body = serde_json::to_string(&args).expect("placeholder json never fails");
-    format!("5{attachment_count}-{body}")
+    match ack_id {
+        Some(id) => format!("5{attachment_count}-{id}{body}"),
+        None => format!("5{attachment_count}-{body}"),
+    }
 }
 
 /// Stateful correlator: feed it text packets and binary frames in arrival order;
@@ -180,6 +189,8 @@ pub enum Event {
     Connected { auth: Option<serde_json::Value> },
     /// DISCONNECT.
     Disconnected,
+    /// `3<id>[...]` ACK reply to a previously-emitted event.
+    Ack { id: u64, args: Vec<serde_json::Value> },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -210,7 +221,7 @@ impl Correlator {
             TextPacket::Connect { auth } => Ok(Some(Event::Connected { auth })),
             TextPacket::Disconnect => Ok(Some(Event::Disconnected)),
             TextPacket::Event { name, args, .. } => Ok(Some(Event::Text { name, args })),
-            TextPacket::Ack { .. } => Ok(None),
+            TextPacket::Ack { id, args } => Ok(Some(Event::Ack { id, args })),
             TextPacket::BinaryEventHeader {
                 attachment_count,
                 name,
@@ -313,9 +324,20 @@ mod tests {
     }
 
     #[test]
-    fn encode_binary_event_uses_placeholders() {
-        let body = encode_binary_event("webrtc", 1);
-        assert_eq!(body, r#"51-["webrtc",{"_placeholder":true,"num":0}]"#);
+    fn encode_binary_event_with_ack_id() {
+        let body = encode_binary_event("client_authentication", 1, Some(0));
+        assert_eq!(
+            body,
+            r#"51-0["client_authentication",{"_placeholder":true,"num":0}]"#
+        );
+        let body = encode_binary_event("webrtc", 1, Some(7));
+        assert_eq!(body, r#"51-7["webrtc",{"_placeholder":true,"num":0}]"#);
+    }
+
+    #[test]
+    fn encode_binary_event_without_ack_id() {
+        let body = encode_binary_event("trigger", 1, None);
+        assert_eq!(body, r#"51-["trigger",{"_placeholder":true,"num":0}]"#);
     }
 
     #[test]

@@ -31,6 +31,11 @@ pub enum SessionError {
 
 pub struct WebRtcSession {
     pc: Arc<RTCPeerConnection>,
+    camera_token: String,
+    /// Our Socket.IO sid, supplied by the server in `40{"sid":"..."}` and
+    /// echoed back in every outbound WebRtcSignal as `session_id` (the JS
+    /// client calls it `clientSocketId`).
+    session_id: String,
 }
 
 impl WebRtcSession {
@@ -39,6 +44,8 @@ impl WebRtcSession {
     /// `rtp_tx` receives every inbound RTP packet on the negotiated video track.
     pub async fn new(
         cfg: &WebRtcConfig,
+        camera_token: String,
+        session_id: String,
         outbound_signal_tx: mpsc::Sender<proto::WebRtcSignal>,
         rtp_tx: mpsc::Sender<RtpPacket>,
     ) -> Result<Self, SessionError> {
@@ -107,12 +114,18 @@ impl WebRtcSession {
 
         // Register ICE candidate callback → forward to outbound channel.
         let candidate_tx = outbound_signal_tx.clone();
+        let candidate_token = camera_token.clone();
+        let candidate_sid = session_id.clone();
         pc.on_ice_candidate(Box::new(move |c| {
             let candidate_tx = candidate_tx.clone();
+            let candidate_token = candidate_token.clone();
+            let candidate_sid = candidate_sid.clone();
             Box::pin(async move {
                 if let Some(c) = c {
                     if let Ok(init) = c.to_json() {
                         let signal = proto::WebRtcSignal {
+                            token: candidate_token,
+                            session_id: candidate_sid,
                             msg_type: 4, // ICE candidate from client
                             direction: 2,
                             body: encode_ice_candidate(
@@ -155,7 +168,11 @@ impl WebRtcSession {
             })
         }));
 
-        Ok(Self { pc })
+        Ok(Self {
+            pc,
+            camera_token,
+            session_id,
+        })
     }
 
     /// Returns a clone of the underlying PC for tasks that need direct access
@@ -172,9 +189,21 @@ impl WebRtcSession {
         outbound_signal_tx: &mpsc::Sender<proto::WebRtcSignal>,
     ) -> Result<(), SessionError> {
         use prost::Message;
+        tracing::debug!(
+            msg_type = signal.msg_type,
+            direction = signal.direction,
+            body_len = signal.body.len(),
+            has_ice_config = signal.ice_config.is_some(),
+            "handle_signal"
+        );
         match signal.msg_type {
-            // 1 = SDP offer from server.
-            1 => {
+            // Observed in real traffic:
+            //   1 = client → server kick-off (we send, never receive)
+            //   2 = client → server SDP answer (we send, never receive)
+            //   3 = server → client SDP offer
+            //   4 = ICE candidate (bidirectional)
+            // We respond to incoming SDP offers (3) and ICE (4).
+            3 => {
                 let body = proto::SdpBody::decode(signal.body.as_slice()).map_err(|e| {
                     SessionError::Decode(format!("decode sdp: {e}"))
                 })?;
@@ -198,8 +227,10 @@ impl WebRtcSession {
                 .expect("encode never fails");
 
                 let reply = proto::WebRtcSignal {
-                    token: signal.token.clone(),
-                    session_id: signal.session_id.clone(),
+                    // Always populate from our known camera_token + session_id;
+                    // inbound may omit them. Prusa rejects without.
+                    token: self.camera_token.clone(),
+                    session_id: self.session_id.clone(),
                     peer_id: signal.peer_id.clone(),
                     msg_type: 2, // SDP answer from client
                     direction: 2,

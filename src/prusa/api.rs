@@ -14,6 +14,11 @@ pub struct Printer {
 pub struct Camera {
     pub id: u64,
     pub name: Option<String>,
+    /// Per-camera persistent token used as the `camera_token` field in the
+    /// signaling server's `client_authentication` event AND as the auth payload
+    /// of the Socket.IO CONNECT (`40{"token":"..."}`). Without it, the server
+    /// returns `Missing client permissions`.
+    pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,7 +174,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/app/printers/u1/cameras"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "cameras": [{"id": 380125, "name": "Front"}],
+                "cameras": [{"id": 380125, "name": "Front", "token": "I47hvQfXx6SOPWD4bO00"}],
             })))
             .mount(&server)
             .await;
@@ -178,6 +183,7 @@ mod tests {
             .unwrap();
         assert_eq!(cameras.len(), 1);
         assert_eq!(cameras[0].id, 380125);
+        assert_eq!(cameras[0].token, "I47hvQfXx6SOPWD4bO00");
     }
 
     #[tokio::test]

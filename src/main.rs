@@ -83,6 +83,27 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::WatchStream { duration_seconds } => {
             let token = orch.access_token().await.context("acquire access token")?;
+
+            // Discover the printer + camera so we can grab the camera's
+            // persistent token (the signaling server uses it as a permission key).
+            let printers = list_printers(&prusa, &endpoints.connect_base, &token)
+                .await
+                .context("list printers")?;
+            let printer = printers
+                .first()
+                .context("no printers visible to this account")?;
+            let cams = list_cameras(&prusa, &endpoints.connect_base, &token, &printer.uuid)
+                .await
+                .with_context(|| format!("list cameras for printer {}", printer.uuid))?;
+            let camera = cams
+                .first()
+                .context("no cameras visible on this printer")?;
+            tracing::info!(
+                camera.id = camera.id,
+                camera.name = camera.name.as_deref().unwrap_or("(unnamed)"),
+                "selected camera",
+            );
+
             let webrtc_cfg = fetch_webrtc_config(&prusa, &token)
                 .await
                 .context("fetch webrtc config")?;
@@ -91,16 +112,24 @@ async fn main() -> anyhow::Result<()> {
                 "fetched webrtc config"
             );
 
-            let signaling = PrusaSignaling::connect(token.clone())
-                .await
-                .context("connect signaling")?;
+            let signaling =
+                PrusaSignaling::connect(camera.token.clone(), token.clone(), webrtc_cfg.clone())
+                    .await
+                    .context("connect signaling")?;
 
             let (signal_tx, signal_rx) = mpsc::channel(32);
             let (rtp_tx, mut rtp_rx) = mpsc::channel(1024);
+            let session_id = signaling.session_id.clone();
             let session = Arc::new(
-                WebRtcSession::new(&webrtc_cfg, signal_tx.clone(), rtp_tx)
-                    .await
-                    .context("build webrtc session")?,
+                WebRtcSession::new(
+                    &webrtc_cfg,
+                    camera.token.clone(),
+                    session_id,
+                    signal_tx.clone(),
+                    rtp_tx,
+                )
+                .await
+                .context("build webrtc session")?,
             );
 
             // RTP packet counter: logs every 5 seconds.

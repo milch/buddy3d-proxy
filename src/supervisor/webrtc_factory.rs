@@ -7,7 +7,7 @@
 use crate::prusa::api::{fetch_webrtc_config, Camera};
 use crate::prusa::auth::AuthOrchestrator;
 use crate::prusa::client::PrusaClient;
-use crate::prusa::commands::{encode_camera_trigger, encode_set_quality};
+use crate::prusa::commands::encode_set_quality;
 use crate::prusa::signaling::client::Outbound;
 use crate::prusa::signaling::PrusaSignaling;
 use crate::rtsp::sdp::{extract_h264_params, H264Params};
@@ -112,25 +112,11 @@ impl StreamFactory for WebRtcFactory {
             // Small grace period so the camera has finished setting up.
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            let trigger = encode_camera_trigger(3, &camera_token_for_post_connect);
-            if outbound_for_post_connect
-                .send(Outbound::BinaryEvent {
-                    name: "trigger".into(),
-                    payload: Bytes::from(trigger),
-                    expect_ack: false,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
-            let quality_payload = encode_set_quality(3, &camera_token_for_post_connect);
+            let payload = encode_set_quality(3, &camera_token_for_post_connect);
             if outbound_for_post_connect
                 .send(Outbound::BinaryEvent {
                     name: "configuration".into(),
-                    payload: Bytes::from(quality_payload),
+                    payload: Bytes::from(payload),
                     expect_ack: false,
                 })
                 .await

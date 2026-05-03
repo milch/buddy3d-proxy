@@ -1,0 +1,112 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub prusa_email: String,
+    pub prusa_password: String,
+    pub prusa_printer_uuid: Option<String>,
+    pub prusa_camera_id: Option<String>,
+    pub rtsp_port: u16,
+    pub rtsp_path: Option<String>,
+    pub rtsp_bind_addr: String,
+    pub idle_timeout: Duration,
+    pub token_store_path: PathBuf,
+    pub health_port: u16,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("required environment variable {0} is unset")]
+    Missing(&'static str),
+    #[error("environment variable {0} has invalid value: {1}")]
+    Invalid(&'static str, String),
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        fn req(k: &'static str) -> Result<String, ConfigError> {
+            std::env::var(k).map_err(|_| ConfigError::Missing(k))
+        }
+        fn opt(k: &str) -> Option<String> {
+            std::env::var(k).ok().filter(|s| !s.is_empty())
+        }
+        fn parse_u16(k: &'static str, default: u16) -> Result<u16, ConfigError> {
+            match std::env::var(k).ok() {
+                Some(v) => v.parse().map_err(|e: std::num::ParseIntError| ConfigError::Invalid(k, e.to_string())),
+                None => Ok(default),
+            }
+        }
+        fn parse_u64(k: &'static str, default: u64) -> Result<u64, ConfigError> {
+            match std::env::var(k).ok() {
+                Some(v) => v.parse().map_err(|e: std::num::ParseIntError| ConfigError::Invalid(k, e.to_string())),
+                None => Ok(default),
+            }
+        }
+        Ok(Self {
+            prusa_email: req("PRUSA_EMAIL")?,
+            prusa_password: req("PRUSA_PASSWORD")?,
+            prusa_printer_uuid: opt("PRUSA_PRINTER_UUID"),
+            prusa_camera_id: opt("PRUSA_CAMERA_ID"),
+            rtsp_port: parse_u16("RTSP_PORT", 8554)?,
+            rtsp_path: opt("RTSP_PATH"),
+            rtsp_bind_addr: opt("RTSP_BIND_ADDR").unwrap_or_else(|| "0.0.0.0".to_string()),
+            idle_timeout: Duration::from_secs(parse_u64("IDLE_TIMEOUT_SECONDS", 60)?),
+            token_store_path: opt("TOKEN_STORE_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/data/tokens.json")),
+            health_port: parse_u16("HEALTH_PORT", 8080)?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
+        // Serialize via a static mutex so tests don't race on env state.
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let saved: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var(k).ok())).collect();
+        for (k, v) in vars { std::env::set_var(k, v); }
+        f();
+        for (k, v) in saved {
+            match v { Some(val) => std::env::set_var(k, val), None => std::env::remove_var(k) }
+        }
+    }
+
+    #[test]
+    fn loads_required_vars_with_defaults() {
+        with_env(&[
+            ("PRUSA_EMAIL", "user@example.com"),
+            ("PRUSA_PASSWORD", "hunter2"),
+        ], || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.prusa_email, "user@example.com");
+            assert_eq!(cfg.prusa_password, "hunter2");
+            assert_eq!(cfg.rtsp_port, 8554);
+            assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
+            assert_eq!(cfg.health_port, 8080);
+            assert_eq!(cfg.token_store_path, PathBuf::from("/data/tokens.json"));
+        });
+    }
+
+    #[test]
+    fn errors_on_missing_email() {
+        with_env(&[("PRUSA_PASSWORD", "x")], || {
+            std::env::remove_var("PRUSA_EMAIL");
+            assert!(matches!(Config::from_env(), Err(ConfigError::Missing("PRUSA_EMAIL"))));
+        });
+    }
+
+    #[test]
+    fn rejects_invalid_port() {
+        with_env(&[
+            ("PRUSA_EMAIL", "u@e.com"),
+            ("PRUSA_PASSWORD", "p"),
+            ("RTSP_PORT", "not-a-number"),
+        ], || {
+            assert!(matches!(Config::from_env(), Err(ConfigError::Invalid("RTSP_PORT", _))));
+        });
+    }
+}

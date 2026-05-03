@@ -9,10 +9,16 @@ use std::sync::Arc;
 pub enum ClientError {
     #[error("network error: {0}")]
     Network(#[source] reqwest::Error),
-    #[error("server error: status {0}")]
-    Server(reqwest::StatusCode),
-    #[error("client error: status {0}")]
-    Client(reqwest::StatusCode),
+    #[error("server error: status {status}; body: {body}")]
+    Server {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("client error: status {status}; body: {body}")]
+    Client {
+        status: reqwest::StatusCode,
+        body: String,
+    },
 }
 
 #[derive(Clone)]
@@ -44,11 +50,26 @@ impl PrusaClient {
         permit.complete(outcome).await;
         match result {
             Err(e) => Err(ClientError::Network(e)),
-            Ok(r) if r.status().is_server_error() => Err(ClientError::Server(r.status())),
-            Ok(r) if r.status().is_client_error() => Err(ClientError::Client(r.status())),
+            Ok(r) if r.status().is_server_error() => {
+                let status = r.status();
+                let body = body_preview(r).await;
+                Err(ClientError::Server { status, body })
+            }
+            Ok(r) if r.status().is_client_error() => {
+                let status = r.status();
+                let body = body_preview(r).await;
+                Err(ClientError::Client { status, body })
+            }
             Ok(r) => Ok(r),
         }
     }
+}
+
+async fn body_preview(resp: Response) -> String {
+    resp.text()
+        .await
+        .map(|s| s.chars().take(800).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -79,7 +100,7 @@ mod tests {
         Mock::given(method("GET")).respond_with(ResponseTemplate::new(503)).mount(&server).await;
         let req = client.request(Method::GET, server.uri().parse().unwrap());
         let err = client.send(req).await.unwrap_err();
-        assert!(matches!(err, ClientError::Server(_)));
+        assert!(matches!(err, ClientError::Server { .. }));
         assert_eq!(client.limiter.tokens().await, 2);
     }
 
@@ -89,7 +110,7 @@ mod tests {
         Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
         let req = client.request(Method::GET, server.uri().parse().unwrap());
         let err = client.send(req).await.unwrap_err();
-        assert!(matches!(err, ClientError::Client(_)));
+        assert!(matches!(err, ClientError::Client { .. }));
         assert_eq!(client.limiter.tokens().await, 3);
     }
 }

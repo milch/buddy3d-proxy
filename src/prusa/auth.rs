@@ -224,7 +224,7 @@ impl AuthOrchestrator {
             let new_tokens = match state.as_ref() {
                 Some(t) => match refresh(&self.client, &self.endpoints, &t.refresh_token).await {
                     Ok(new) => new,
-                    Err(AuthError::Http(ClientError::Client(_))) => {
+                    Err(AuthError::Http(ClientError::Client { .. })) => {
                         tracing::warn!("refresh token rejected; falling back to bootstrap");
                         bootstrap(&self.client, &self.endpoints, &self.email, &self.password)
                             .await?
@@ -448,7 +448,7 @@ mod tests {
             .mount(&server)
             .await;
         let err = refresh(&prusa, &endpoints, "bad").await.unwrap_err();
-        assert!(matches!(err, AuthError::Http(ClientError::Client(_))));
+        assert!(matches!(err, AuthError::Http(ClientError::Client { .. })));
     }
 
     #[tokio::test]

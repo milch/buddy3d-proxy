@@ -27,7 +27,14 @@ async fn real_prusa_account_smoke() {
         .unwrap_or_else(|_| "/tmp/buddy3d-tokens.json".into());
 
     let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
-    let http = reqwest::Client::builder().cookie_store(true).build().unwrap();
+    let http = reqwest::Client::builder()
+        .cookie_store(true)
+        .user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        )
+        .build()
+        .unwrap();
     let prusa = PrusaClient::new(http, limiter);
     let endpoints = AuthEndpoints::default();
     let store = TokenStore::new(&token_path);
@@ -103,7 +110,7 @@ async fn real_prusa_stream_smoke() {
     let webrtc_cfg = fetch_webrtc_config(&prusa, &token)
         .await
         .expect("webrtc config");
-    let signaling = PrusaSignaling::connect(webrtc_cfg.token.clone(), token.clone())
+    let signaling = PrusaSignaling::connect(token.clone())
         .await
         .expect("signaling");
 

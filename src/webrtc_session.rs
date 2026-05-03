@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
+use webrtc::ice_transport::ice_credential_type::RTCIceCredentialType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -52,16 +53,50 @@ impl WebRtcSession {
             .with_interceptor_registry(registry)
             .build();
 
+        // webrtc-rs 0.8 validates each ICE server entry: TURN entries must have
+        // non-empty username AND credential, STUN entries must have empty creds,
+        // and `?transport=...` query strings on TURN URLs are not parsed correctly
+        // by some webrtc-rs versions. Split mixed entries and strip query strings
+        // defensively.
         let ice_servers: Vec<RTCIceServer> = cfg
             .ice_servers
             .iter()
-            .map(|s| RTCIceServer {
-                urls: s.url_list(),
-                username: s.username.clone().unwrap_or_default(),
-                credential: s.credential.clone().unwrap_or_default(),
-                ..Default::default()
+            .flat_map(|s| {
+                let username = s.username.clone().unwrap_or_default();
+                let credential = s.credential.clone().unwrap_or_default();
+                s.url_list()
+                    .into_iter()
+                    .map(|url| {
+                        let is_turn = url.starts_with("turn:") || url.starts_with("turns:");
+                        let clean_url = url.split('?').next().unwrap_or(&url).to_string();
+                        RTCIceServer {
+                            urls: vec![clean_url],
+                            username: if is_turn { username.clone() } else { String::new() },
+                            credential: if is_turn {
+                                credential.clone()
+                            } else {
+                                String::new()
+                            },
+                            // webrtc-rs's RTCIceCredentialType::Unspecified (the
+                            // Default) is rejected by validate(); set Password
+                            // explicitly for TURN entries (RFC 5389 username/password).
+                            credential_type: if is_turn {
+                                RTCIceCredentialType::Password
+                            } else {
+                                RTCIceCredentialType::Unspecified
+                            },
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
+        for s in &ice_servers {
+            tracing::debug!(
+                urls = ?s.urls,
+                has_creds = !s.username.is_empty(),
+                "ice server"
+            );
+        }
 
         let configuration = RTCConfiguration {
             ice_servers,

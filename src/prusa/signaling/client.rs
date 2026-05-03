@@ -54,7 +54,29 @@ pub enum ClientError {
 pub async fn connect(
     endpoint_url: &str,
 ) -> Result<(mpsc::Sender<Outbound>, mpsc::Receiver<Inbound>), ClientError> {
-    let (ws, _) = tokio_tungstenite::connect_async(endpoint_url)
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::{ORIGIN, USER_AGENT};
+
+    // The Prusa signaling server appears to gate Socket.IO `client_authentication`
+    // on the WS upgrade Origin. The captured browser handshake uses
+    // `Origin: https://connect.prusa3d.com` and a browser User-Agent; without
+    // them the server returns "Missing client permissions" after auth.
+    let mut req = endpoint_url
+        .into_client_request()
+        .map_err(ClientError::Connect)?;
+    req.headers_mut().insert(
+        ORIGIN,
+        "https://connect.prusa3d.com".parse().expect("static value"),
+    );
+    req.headers_mut().insert(
+        USER_AGENT,
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+            .parse()
+            .expect("static value"),
+    );
+
+    let (ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .map_err(ClientError::Connect)?;
 
@@ -119,8 +141,8 @@ pub async fn connect(
                                             let payload = attachments.into_iter().next().unwrap_or_default();
                                             let _ = inbound_tx.send(Inbound::BinaryEvent { name, payload }).await;
                                         }
-                                        Ok(Some(socketio::Event::Text { name, .. })) => {
-                                            tracing::debug!(event = %name, "received text-only socket.io event");
+                                        Ok(Some(socketio::Event::Text { name, args })) => {
+                                            tracing::warn!(event = %name, args = ?args, "received text-only socket.io event");
                                         }
                                         Ok(None) => {}
                                         Err(e) => {

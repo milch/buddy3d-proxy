@@ -43,6 +43,10 @@ async fn main() -> anyhow::Result<()> {
     let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
     let http = reqwest::Client::builder()
         .cookie_store(true)
+        .user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        )
         .build()
         .context("build reqwest client")?;
     let prusa = PrusaClient::new(http, limiter);
@@ -87,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
                 "fetched webrtc config"
             );
 
-            let signaling = PrusaSignaling::connect(webrtc_cfg.token.clone(), token.clone())
+            let signaling = PrusaSignaling::connect(token.clone())
                 .await
                 .context("connect signaling")?;
 

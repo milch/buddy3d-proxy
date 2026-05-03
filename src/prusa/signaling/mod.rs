@@ -41,12 +41,11 @@ pub struct PrusaSignaling {
 
 impl PrusaSignaling {
     /// Connect, authenticate via `client_authentication`, and start dispatching events.
-    /// `webrtc_token` is the short-lived token from `fetch_webrtc_config`.
-    /// `access_jwt` is the Prusa Connect access token.
-    pub async fn connect(
-        webrtc_token: String,
-        access_jwt: String,
-    ) -> Result<Self, SignalingError> {
+    /// `access_jwt` is the Prusa Connect access token. The 20-char session token is
+    /// generated client-side (the HAR shows `/v1/camera-webrtc-config` doesn't return
+    /// one — it's just a random correlator the client picks).
+    pub async fn connect(access_jwt: String) -> Result<Self, SignalingError> {
+        let webrtc_token = generate_session_token();
         let (outbound, mut raw_events) = client::connect(SIGNALING_URL).await?;
 
         // Send Engine.IO MESSAGE → Socket.IO CONNECT (`40{...}`) with token auth.
@@ -131,6 +130,20 @@ impl PrusaSignaling {
             .await
             .map_err(|_| SignalingError::SendClosed)
     }
+}
+
+/// Generate a 20-character alphanumeric session token like the captured HAR
+/// shows (`I47hvQfXx6SOPWD4bO00`). The Prusa client appears to just pick a random
+/// 20-char string and use it as both the Socket.IO CONNECT auth token and the
+/// `ClientAuthentication.token` proto field.
+fn generate_session_token() -> String {
+    use rand::seq::IndexedRandom;
+    let alphabet: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
+    (0..20)
+        .map(|_| *alphabet.choose(&mut rng).unwrap() as char)
+        .collect()
 }
 
 fn translate_binary(name: &str, payload: Bytes) -> SignalingEvent {

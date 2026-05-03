@@ -54,9 +54,22 @@ impl WebRtcSession {
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media_engine)?;
 
+        // Default mDNS mode is QueryAndGather, which means our host
+        // candidates get advertised as `<uuid>.local` mDNS hostnames.
+        // Browsers do this for privacy, but Prusa's camera doesn't run an
+        // mDNS resolver, so it can't reach us at those names — and we get
+        // forced to TURN. Switch to QueryOnly: still accept the camera's
+        // mDNS-style candidates if any, but emit our own as bare IPs so
+        // a same-LAN camera can pair with us directly.
+        let mut setting_engine = webrtc::api::setting_engine::SettingEngine::default();
+        setting_engine.set_ice_multicast_dns_mode(
+            webrtc::ice::mdns::MulticastDnsMode::QueryOnly,
+        );
+
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
+            .with_setting_engine(setting_engine)
             .build();
 
         // webrtc-rs 0.8 validates each ICE server entry: TURN entries must have
@@ -115,6 +128,7 @@ impl WebRtcSession {
             Box::pin(async move {
                 if let Some(c) = c {
                     if let Ok(init) = c.to_json() {
+                        tracing::debug!(candidate = %init.candidate, "outbound ice candidate");
                         let signal = proto::WebRtcSignal {
                             token: candidate_token,
                             session_id: candidate_sid,

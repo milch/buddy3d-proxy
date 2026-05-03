@@ -237,6 +237,7 @@ mod tests {
                     profile_level_id: "42c01e".into(),
                     sprop_parameter_sets: "Z0L,aM4".into(),
                     packetization_mode: 1,
+                    payload_type: 96,
                 },
                 StopHandle {
                     kill: Box::new(()),

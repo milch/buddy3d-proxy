@@ -18,9 +18,15 @@ use buddy3d_proxy::prusa::client::PrusaClient;
 use buddy3d_proxy::rate_limit::RateLimiter;
 use buddy3d_proxy::token_store::TokenStore;
 
+fn install_crypto_provider() {
+    // rustls 0.23 needs an explicit crypto provider before any TLS handshake.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 #[tokio::test]
 #[ignore]
 async fn real_prusa_account_smoke() {
+    install_crypto_provider();
     let email = std::env::var("PRUSA_EMAIL").expect("PRUSA_EMAIL");
     let password = std::env::var("PRUSA_PASSWORD").expect("PRUSA_PASSWORD");
     let token_path = std::env::var("TOKEN_STORE_PATH")
@@ -73,6 +79,7 @@ async fn real_prusa_account_smoke() {
 #[tokio::test]
 #[ignore]
 async fn real_prusa_stream_smoke() {
+    install_crypto_provider();
     use buddy3d_proxy::prusa::api::fetch_webrtc_config;
     use buddy3d_proxy::prusa::auth::{AuthEndpoints, AuthOrchestrator};
     use buddy3d_proxy::prusa::client::PrusaClient;

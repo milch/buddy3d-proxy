@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
-use webrtc::ice_transport::ice_credential_type::RTCIceCredentialType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -84,14 +83,7 @@ impl WebRtcSession {
                             } else {
                                 String::new()
                             },
-                            // webrtc-rs's RTCIceCredentialType::Unspecified (the
-                            // Default) is rejected by validate(); set Password
-                            // explicitly for TURN entries (RFC 5389 username/password).
-                            credential_type: if is_turn {
-                                RTCIceCredentialType::Password
-                            } else {
-                                RTCIceCredentialType::Unspecified
-                            },
+                            ..Default::default()
                         }
                     })
                     .collect::<Vec<_>>()

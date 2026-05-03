@@ -79,9 +79,34 @@ impl StreamFactory for WebRtcFactory {
 
         // Forward RTP from the per-session mpsc into the broadcast channel.
         let forwarder_handle = tokio::spawn(async move {
-            while let Some(pkt) = rtp_internal_rx.recv().await {
-                let _ = rtp_tx.send(pkt);
+            let mut received: u64 = 0;
+            let mut delivered: u64 = 0;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    pkt = rtp_internal_rx.recv() => {
+                        match pkt {
+                            Some(pkt) => {
+                                received += 1;
+                                if rtp_tx.send(pkt).is_ok() {
+                                    delivered += 1;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = tick.tick() => {
+                        tracing::debug!(
+                            received,
+                            delivered,
+                            subscribers = rtp_tx.receiver_count(),
+                            "rtp forwarder stats"
+                        );
+                    }
+                }
             }
+            tracing::info!(received, delivered, "rtp forwarder ended");
         });
 
         // Poll for the negotiated remote SDP — `handle_signal` calls

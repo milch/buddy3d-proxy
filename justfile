@@ -50,5 +50,13 @@ gen-proto:
 smoke-stream:
     cargo test --test manual_smoke real_prusa_stream_smoke -- --ignored --nocapture
 
+# Run the RTSP proxy. Listens on RTSP_PORT (default 8554) and serves
+# rtsp://localhost:8554/<camera-name>. WebRTC stays idle until a client
+# connects, then is torn down IDLE_TIMEOUT_SECONDS after the last viewer
+# disconnects. Open the stream in another terminal with:
+#     vlc rtsp://localhost:8554/<your-camera-slug>
+serve:
+    cargo run --bin buddy3d-proxy -- serve
+
 # Format + lint + test, in that order. Run before pushing.
 ci: fmt-check lint test

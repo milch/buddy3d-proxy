@@ -41,6 +41,11 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls 0.23 (pulled in by webrtc 0.17 + reqwest 0.13) requires an
+    // explicit process-level CryptoProvider before any TLS handshake. Install
+    // aws-lc-rs once at startup; ignore the result if it's already installed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     init_tracing();
     let cli = Cli::parse();
     let cfg = Config::from_env().context("load config from environment")?;

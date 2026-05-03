@@ -137,9 +137,14 @@ impl WebRtcSession {
                 if let Some(c) = c {
                     if let Ok(init) = c.to_json() {
                         tracing::debug!(candidate = %init.candidate, "outbound ice candidate");
+                        // Firefox/Safari set peer_id = own sid on EVERY outbound
+                        // webrtc message (it's the sender's id, not the recipient's).
+                        // The camera tolerates the wrong value but treating peer_id
+                        // as "sender id" keeps us byte-for-byte aligned with browsers.
                         let signal = proto::WebRtcSignal {
                             token: candidate_token,
-                            session_id: candidate_sid,
+                            session_id: candidate_sid.clone(),
+                            peer_id: candidate_sid,
                             msg_type: 4, // ICE candidate from client
                             direction: 2,
                             body: encode_ice_candidate(
@@ -301,11 +306,12 @@ impl WebRtcSession {
                 .expect("encode never fails");
 
                 let reply = proto::WebRtcSignal {
-                    // Always populate from our known camera_token + session_id;
-                    // inbound may omit them. Prusa rejects without.
+                    // peer_id is the SENDER's id. Browsers always set it to
+                    // their own sid on outbound — never echo the camera's id
+                    // from the inbound offer.
                     token: self.camera_token.clone(),
                     session_id: self.session_id.clone(),
-                    peer_id: signal.peer_id.clone(),
+                    peer_id: self.session_id.clone(),
                     msg_type: 2, // SDP answer from client
                     direction: 2,
                     body: answer_buf,

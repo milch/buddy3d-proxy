@@ -32,6 +32,11 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         duration_seconds: u64,
     },
+    /// Run the RTSP proxy. Listens on RTSP_PORT (default 8554) and serves the
+    /// camera at rtsp://host:RTSP_PORT/RTSP_PATH. WebRTC stays idle until the
+    /// first viewer connects, and is torn down IDLE_TIMEOUT_SECONDS after the
+    /// last viewer disconnects.
+    Serve,
 }
 
 #[tokio::main]
@@ -181,6 +186,80 @@ async fn main() -> anyhow::Result<()> {
             let _ = session.close().await;
             counter.abort();
         }
+        Cmd::Serve => {
+            use buddy3d_proxy::rtsp::Server;
+            use buddy3d_proxy::supervisor::webrtc_factory::WebRtcFactory;
+            use buddy3d_proxy::supervisor::Supervisor;
+
+            let token = orch.access_token().await.context("acquire access token")?;
+            let printers = list_printers(&prusa, &endpoints.connect_base, &token)
+                .await
+                .context("list printers")?;
+            let printer = printers
+                .first()
+                .context("no printers visible to this account")?;
+            let cams = list_cameras(&prusa, &endpoints.connect_base, &token, &printer.uuid)
+                .await
+                .with_context(|| format!("list cameras for printer {}", printer.uuid))?;
+            let camera = cams
+                .first()
+                .context("no cameras visible on this printer")?
+                .clone();
+
+            let camera_name = camera.name.clone().unwrap_or_else(|| "buddy3d".into());
+            let rtsp_path = cfg.rtsp_path.clone().unwrap_or_else(|| slugify(&camera_name));
+            tracing::info!(
+                camera.id = camera.id,
+                camera.name = %camera_name,
+                rtsp_path = %rtsp_path,
+                "selected camera"
+            );
+
+            let factory = Arc::new(WebRtcFactory {
+                orch: orch.clone(),
+                prusa: prusa.clone(),
+                camera,
+            });
+            let supervisor = Supervisor::new(
+                factory,
+                camera_name,
+                rtsp_path.clone(),
+                cfg.idle_timeout,
+            );
+
+            let _handle = Server::start(&cfg.rtsp_bind_addr, cfg.rtsp_port, supervisor)
+                .await
+                .context("rtsp server start")?;
+
+            tracing::info!(
+                "rtsp ready at rtsp://{}:{}/{}; waiting for clients",
+                cfg.rtsp_bind_addr,
+                cfg.rtsp_port,
+                rtsp_path
+            );
+
+            // Run until Ctrl+C.
+            tokio::signal::ctrl_c()
+                .await
+                .context("install ctrl+c handler")?;
+            tracing::info!("ctrl+c received; shutting down");
+        }
     }
     Ok(())
+}
+
+/// Lowercase, replace whitespace + non-alphanumerics with `-`, collapse runs.
+fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_dash = true;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
 }

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod jwt;
 pub mod pkce;
+pub mod prusa;
 pub mod proto;
 pub mod rate_limit;
 pub mod token_store;

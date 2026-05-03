@@ -6,6 +6,7 @@ pub mod proto;
 pub mod rate_limit;
 pub mod token_store;
 pub mod tracing_redact;
+pub mod webrtc_session;
 
 pub fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};

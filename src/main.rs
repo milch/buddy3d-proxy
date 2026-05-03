@@ -39,14 +39,15 @@ enum Cmd {
     Serve,
     /// Tell the camera to reboot. Useful when the camera has degraded its
     /// stream quality (e.g. dropped to 640x480@10fps after many reconnects).
-    /// The protobuf field number for `start_device_reboot` is not in any
-    /// captured HAR, so it has to be probed: try `--field 3`, `--field 4`,
-    /// etc. until the camera goes offline + comes back. Other observed
-    /// CameraTrigger field names are: get_snapshot, set_timelapse_enable,
-    /// snapshot_interval, send_camera_name.
+    /// Sends a CameraTrigger with `start_device_reboot=1` (proto field 9,
+    /// confirmed against a captured browser-initiated reboot in
+    /// api/2025-05-03 14-05.har).
     RestartCamera {
-        /// CameraTrigger protobuf field number to set to 1.
-        #[arg(long, default_value_t = 3)]
+        /// CameraTrigger protobuf field number to set to 1. The default (9)
+        /// is `start_device_reboot`. Other observed field names from the JS
+        /// bundle: get_snapshot, set_timelapse_enable, snapshot_interval,
+        /// send_camera_name — their field numbers are still unknown.
+        #[arg(long, default_value_t = 9)]
         field: u32,
     },
 }

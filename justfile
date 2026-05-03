@@ -46,5 +46,9 @@ lint:
 gen-proto:
     cargo xtask gen-proto
 
+# Run the real-Prusa streaming smoke test (auth + signaling + WebRTC + RTP).
+smoke-stream:
+    cargo test --test manual_smoke real_prusa_stream_smoke -- --ignored --nocapture
+
 # Format + lint + test, in that order. Run before pushing.
 ci: fmt-check lint test

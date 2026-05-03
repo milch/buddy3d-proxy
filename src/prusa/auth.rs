@@ -112,6 +112,38 @@ pub async fn bootstrap(
     })
 }
 
+pub async fn refresh(
+    client: &PrusaClient,
+    endpoints: &AuthEndpoints,
+    refresh_token: &str,
+) -> Result<StoredTokens, AuthError> {
+    let token_url = endpoints
+        .account_base
+        .join("/o/token/")
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+    let resp = client
+        .send(client.request(Method::POST, token_url).form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", CLIENT_ID),
+        ]))
+        .await?;
+    let body: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+    let access_expires_at = crate::jwt::read_exp(&body.access_token)
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(StoredTokens {
+        access_token: body.access_token,
+        refresh_token: body.refresh_token,
+        access_expires_at,
+    })
+}
+
 fn extract_csrf(html: &str) -> Option<String> {
     // Django renders: <input type="hidden" name="csrfmiddlewaretoken" value="...">
     let needle = "name=\"csrfmiddlewaretoken\" value=\"";
@@ -236,5 +268,45 @@ mod tests {
 
         let err = bootstrap(&prusa, &endpoints, "u@e.com", "wrong").await.unwrap_err();
         assert!(matches!(err, AuthError::LoginRejected));
+    }
+
+    #[tokio::test]
+    async fn refresh_returns_new_tokens() {
+        let server = MockServer::start().await;
+        let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
+        let prusa = PrusaClient::new(reqwest::Client::new(), limiter);
+        let endpoints = AuthEndpoints {
+            account_base: server.uri().parse().unwrap(),
+            connect_base: server.uri().parse().unwrap(),
+        };
+        let exp = 9_999_999_999u64;
+        Mock::given(method("POST"))
+            .and(path("/o/token/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": mint_jwt(exp),
+                "refresh_token": mint_jwt(exp),
+            })))
+            .mount(&server)
+            .await;
+        let tokens = refresh(&prusa, &endpoints, "old-refresh").await.unwrap();
+        assert_eq!(tokens.access_expires_at, exp);
+    }
+
+    #[tokio::test]
+    async fn refresh_returns_client_error_when_token_invalid() {
+        let server = MockServer::start().await;
+        let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
+        let prusa = PrusaClient::new(reqwest::Client::new(), limiter);
+        let endpoints = AuthEndpoints {
+            account_base: server.uri().parse().unwrap(),
+            connect_base: server.uri().parse().unwrap(),
+        };
+        Mock::given(method("POST"))
+            .and(path("/o/token/"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let err = refresh(&prusa, &endpoints, "bad").await.unwrap_err();
+        assert!(matches!(err, AuthError::Http(ClientError::Client(_))));
     }
 }

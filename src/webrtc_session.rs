@@ -35,6 +35,14 @@ pub struct WebRtcSession {
     /// echoed back in every outbound WebRtcSignal as `session_id` (the JS
     /// client calls it `clientSocketId`).
     session_id: String,
+    /// ICE candidates that arrived before we had a remote description set.
+    /// Trickle ICE means the camera sends its host candidate FIRST (it's the
+    /// fastest to gather), often before the SDP offer arrives. webrtc-rs
+    /// rejects `add_ice_candidate` until the remote description is in place,
+    /// so we buffer those early candidates and drain once SDP is processed.
+    /// Critical for LAN-direct: the host candidate is usually the very
+    /// first one to arrive.
+    pending_ice: tokio::sync::Mutex<Vec<webrtc::ice_transport::ice_candidate::RTCIceCandidateInit>>,
 }
 
 impl WebRtcSession {
@@ -219,6 +227,7 @@ impl WebRtcSession {
             pc,
             camera_token,
             session_id,
+            pending_ice: tokio::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -261,6 +270,24 @@ impl WebRtcSession {
                         body.sdp,
                     )?;
                 self.pc.set_remote_description(offer).await?;
+
+                // Drain any ICE candidates that arrived before SDP. The
+                // camera trickles host candidates first, often beating the
+                // SDP offer to us. Without this, the host candidate is
+                // dropped and ICE has only srflx/relay to pair against.
+                let mut pending = self.pending_ice.lock().await;
+                if !pending.is_empty() {
+                    tracing::debug!(
+                        n = pending.len(),
+                        "draining pre-SDP ice candidates"
+                    );
+                }
+                for init in pending.drain(..) {
+                    if let Err(e) = self.pc.add_ice_candidate(init).await {
+                        tracing::warn!(error = %e, "drained ice candidate rejected");
+                    }
+                }
+                drop(pending);
 
                 let answer = self.pc.create_answer(None).await?;
                 self.pc.set_local_description(answer.clone()).await?;
@@ -305,7 +332,16 @@ impl WebRtcSession {
                     sdp_mline_index: Some(0),
                     username_fragment: None,
                 };
-                self.pc.add_ice_candidate(init).await?;
+                // If remote description isn't set yet, buffer. Otherwise add now.
+                if self.pc.remote_description().await.is_some() {
+                    self.pc.add_ice_candidate(init).await?;
+                } else {
+                    tracing::debug!(
+                        candidate = %init.candidate,
+                        "buffering ice candidate (no remote description yet)"
+                    );
+                    self.pending_ice.lock().await.push(init);
+                }
             }
             other => {
                 tracing::debug!(msg_type = other, "ignoring webrtc signal");

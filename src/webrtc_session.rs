@@ -23,6 +23,8 @@ pub enum SessionError {
     WebRtc(#[from] webrtc::Error),
     #[error("send channel closed")]
     SendClosed,
+    #[error("protobuf decode error: {0}")]
+    Decode(String),
 }
 
 pub struct WebRtcSession {
@@ -124,6 +126,78 @@ impl WebRtcSession {
     /// (SDP and ICE handlers in subsequent tasks).
     pub fn peer_connection(&self) -> Arc<RTCPeerConnection> {
         self.pc.clone()
+    }
+
+    /// Process an inbound `WebRtcSignal` from the signaling server. Handles
+    /// SDP offers (responding with an answer) and ICE candidates.
+    pub async fn handle_signal(
+        &self,
+        signal: &proto::WebRtcSignal,
+        outbound_signal_tx: &mpsc::Sender<proto::WebRtcSignal>,
+    ) -> Result<(), SessionError> {
+        use prost::Message;
+        match signal.msg_type {
+            // 1 = SDP offer from server.
+            1 => {
+                let body = proto::SdpBody::decode(signal.body.as_slice()).map_err(|e| {
+                    SessionError::Decode(format!("decode sdp: {e}"))
+                })?;
+                tracing::debug!(sdp_len = body.sdp.len(), mid = %body.mid, "received SDP offer");
+
+                let offer =
+                    webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(
+                        body.sdp,
+                    )?;
+                self.pc.set_remote_description(offer).await?;
+
+                let answer = self.pc.create_answer(None).await?;
+                self.pc.set_local_description(answer.clone()).await?;
+
+                let mut answer_buf = Vec::new();
+                proto::SdpBody {
+                    sdp: answer.sdp,
+                    mid: body.mid.clone(),
+                }
+                .encode(&mut answer_buf)
+                .expect("encode never fails");
+
+                let reply = proto::WebRtcSignal {
+                    token: signal.token.clone(),
+                    session_id: signal.session_id.clone(),
+                    peer_id: signal.peer_id.clone(),
+                    msg_type: 2, // SDP answer from client
+                    direction: 2,
+                    body: answer_buf,
+                    ..Default::default()
+                };
+                outbound_signal_tx
+                    .send(reply)
+                    .await
+                    .map_err(|_| SessionError::SendClosed)?;
+            }
+            // 4 = ICE candidate from server.
+            4 => {
+                let body = proto::IceCandidateBody::decode(signal.body.as_slice()).map_err(|e| {
+                    SessionError::Decode(format!("decode ice: {e}"))
+                })?;
+                let candidate_line = body
+                    .candidate
+                    .strip_prefix("a=")
+                    .unwrap_or(&body.candidate)
+                    .to_string();
+                let init = webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
+                    candidate: candidate_line,
+                    sdp_mid: Some(body.stream_id.clone()),
+                    sdp_mline_index: Some(0),
+                    username_fragment: None,
+                };
+                self.pc.add_ice_candidate(init).await?;
+            }
+            other => {
+                tracing::debug!(msg_type = other, "ignoring webrtc signal");
+            }
+        }
+        Ok(())
     }
 
     pub async fn close(&self) -> Result<(), SessionError> {

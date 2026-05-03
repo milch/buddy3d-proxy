@@ -1,0 +1,240 @@
+//! OAuth2 Authorization Code with PKCE against `account.prusa3d.com`.
+//!
+//! Steps reproduced from the captured HAR:
+//!   1. GET  /login/?next=/o/authorize/?...  → HTML page containing csrfmiddlewaretoken
+//!   2. POST /login/?next=/o/authorize/?...  → 302 chain ending at connect.prusa3d.com/login/auth-callback?code=...
+//!      We follow redirects manually so we can intercept the `code` query parameter.
+//!   3. POST /o/token/  grant_type=authorization_code  → { access_token, refresh_token }
+
+use crate::pkce::Pkce;
+use crate::prusa::client::{ClientError, PrusaClient};
+use crate::token_store::StoredTokens;
+use reqwest::{Method, Url};
+use serde::Deserialize;
+
+pub const CLIENT_ID: &str = "MRHTlZhZqkNrrQ6FUPtjyusAz8nc59ErHXP8XkS4";
+pub const REDIRECT_URI: &str = "https://connect.prusa3d.com/login/auth-callback";
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("http error: {0}")]
+    Http(#[from] ClientError),
+    #[error("could not extract csrfmiddlewaretoken from login page")]
+    NoCsrf,
+    #[error("login failed (likely wrong credentials, MFA enabled, or account locked)")]
+    LoginRejected,
+    #[error("login response did not include an auth code in the redirect chain")]
+    NoAuthCode,
+    #[error("token exchange returned malformed response: {0}")]
+    BadTokenResponse(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    refresh_token: String,
+}
+
+/// Configuration for the auth endpoints. In production these are constants;
+/// tests inject `MockServer` URIs.
+#[derive(Debug, Clone)]
+pub struct AuthEndpoints {
+    pub account_base: Url,    // e.g. "https://account.prusa3d.com"
+    pub connect_base: Url,    // e.g. "https://connect.prusa3d.com"
+}
+
+impl Default for AuthEndpoints {
+    fn default() -> Self {
+        Self {
+            account_base: "https://account.prusa3d.com".parse().unwrap(),
+            connect_base: "https://connect.prusa3d.com".parse().unwrap(),
+        }
+    }
+}
+
+pub async fn bootstrap(
+    client: &PrusaClient,
+    endpoints: &AuthEndpoints,
+    email: &str,
+    password: &str,
+) -> Result<StoredTokens, AuthError> {
+    let pkce = Pkce::generate();
+    let next_path = format!(
+        "/o/authorize/?response_type=code&client_id={}&code_challenge_method=S256&code_challenge={}&redirect_uri={}",
+        CLIENT_ID,
+        pkce.challenge,
+        urlencoding::encode(REDIRECT_URI),
+    );
+    let login_url = endpoints.account_base.join(&format!("/login/?next={}", urlencoding::encode(&next_path)))
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+
+    // Step 1: GET the login page, extract csrfmiddlewaretoken.
+    let resp = client.send(client.request(Method::GET, login_url.clone())).await?;
+    let body = resp.text().await.map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+    let csrf = extract_csrf(&body).ok_or(AuthError::NoCsrf)?;
+
+    // Step 2: POST credentials, intercept redirect chain to capture `code`.
+    let form = [
+        ("csrfmiddlewaretoken", csrf.as_str()),
+        ("next", next_path.as_str()),
+        ("email", email),
+        ("password", password),
+    ];
+    let no_redirect_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .cookie_store(true)
+        .build()
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+    let code = follow_chain_for_code(&no_redirect_client, login_url, &form).await?;
+
+    // Step 3: exchange code for tokens.
+    let token_url = endpoints.account_base.join("/o/token/")
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+    let resp = client.send(
+        client.request(Method::POST, token_url).form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("client_id", CLIENT_ID),
+            ("redirect_uri", REDIRECT_URI),
+            ("code_verifier", pkce.verifier.as_str()),
+        ]),
+    ).await?;
+    let tokens: TokenResponse = resp.json().await.map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+    let access_expires_at = crate::jwt::read_exp(&tokens.access_token)
+        .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(StoredTokens {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        access_expires_at,
+    })
+}
+
+fn extract_csrf(html: &str) -> Option<String> {
+    // Django renders: <input type="hidden" name="csrfmiddlewaretoken" value="...">
+    let needle = "name=\"csrfmiddlewaretoken\" value=\"";
+    let start = html.find(needle)? + needle.len();
+    let end = html[start..].find('"')? + start;
+    Some(html[start..end].to_string())
+}
+
+async fn follow_chain_for_code(
+    client: &reqwest::Client,
+    login_url: Url,
+    form: &[(&str, &str)],
+) -> Result<String, AuthError> {
+    let mut next_request: Option<reqwest::Request> = Some(
+        client.post(login_url).form(form).build().map_err(|e| AuthError::BadTokenResponse(e.to_string()))?,
+    );
+    for _hop in 0..6 {
+        let req = match next_request.take() { Some(r) => r, None => return Err(AuthError::NoAuthCode) };
+        let resp = client.execute(req).await.map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+        if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
+            let url = resp.url().join(loc.to_str().unwrap_or_default())
+                .map_err(|e| AuthError::BadTokenResponse(e.to_string()))?;
+            if let Some(code) = url.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string()) {
+                return Ok(code);
+            }
+            next_request = Some(client.get(url).build().map_err(|e| AuthError::BadTokenResponse(e.to_string()))?);
+            continue;
+        }
+        // No Location header and no code in URL: the login form was rejected.
+        return Err(AuthError::LoginRejected);
+    }
+    Err(AuthError::NoAuthCode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_csrf_finds_django_token() {
+        let html = r#"<form><input type="hidden" name="csrfmiddlewaretoken" value="abc123XYZ"></form>"#;
+        assert_eq!(extract_csrf(html), Some("abc123XYZ".to_string()));
+    }
+
+    #[test]
+    fn extract_csrf_returns_none_when_missing() {
+        assert!(extract_csrf("<form></form>").is_none());
+    }
+
+    use crate::rate_limit::RateLimiter;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path}};
+
+    fn mint_jwt(exp: u64) -> String {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{{\"sub\":\"u\",\"exp\":{}}}", exp).as_bytes());
+        format!("{}.{}.sig", header, payload)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_flow_succeeds_with_mocked_account_server() {
+        let server = MockServer::start().await;
+        let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
+        let prusa = PrusaClient::new(reqwest::Client::new(), limiter);
+        let endpoints = AuthEndpoints {
+            account_base: server.uri().parse().unwrap(),
+            connect_base: server.uri().parse().unwrap(),
+        };
+
+        // Mock GET /login/ → return HTML with CSRF.
+        Mock::given(method("GET")).and(path("/login/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<input type="hidden" name="csrfmiddlewaretoken" value="csrftoken">"#,
+            ))
+            .mount(&server).await;
+
+        // Mock POST /login/ → 302 to /o/authorize/
+        Mock::given(method("POST")).and(path("/login/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/o/authorize/?response_type=code&client_id=X"))
+            .mount(&server).await;
+
+        // Mock GET /o/authorize/ → 302 to redirect_uri with code.
+        let callback = format!("{}/login/auth-callback?code=AUTHCODE", server.uri());
+        Mock::given(method("GET")).and(path("/o/authorize/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", callback.as_str()))
+            .mount(&server).await;
+
+        // Mock POST /o/token/ → access + refresh.
+        let exp = 9_999_999_999u64;
+        let access = mint_jwt(exp);
+        let refresh = mint_jwt(exp);
+        Mock::given(method("POST")).and(path("/o/token/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": access, "refresh_token": refresh,
+            })))
+            .mount(&server).await;
+
+        let tokens = bootstrap(&prusa, &endpoints, "u@e.com", "pw").await.unwrap();
+        assert_eq!(tokens.access_expires_at, exp);
+        assert!(!tokens.refresh_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_returns_login_rejected_when_form_post_returns_200() {
+        let server = MockServer::start().await;
+        let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
+        let prusa = PrusaClient::new(reqwest::Client::new(), limiter);
+        let endpoints = AuthEndpoints {
+            account_base: server.uri().parse().unwrap(),
+            connect_base: server.uri().parse().unwrap(),
+        };
+        Mock::given(method("GET")).and(path("/login/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<input name="csrfmiddlewaretoken" value="x">"#,
+            )).mount(&server).await;
+        Mock::given(method("POST")).and(path("/login/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("login form re-rendered with errors"))
+            .mount(&server).await;
+
+        let err = bootstrap(&prusa, &endpoints, "u@e.com", "wrong").await.unwrap_err();
+        assert!(matches!(err, AuthError::LoginRejected));
+    }
+}

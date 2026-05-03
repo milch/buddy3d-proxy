@@ -15,7 +15,7 @@ pub fn redact<S: AsRef<str>>(_value: S) -> &'static str {
 /// Redact-aware Debug-like formatting for an `Option<String>`: `Some(<redacted>)` or `None`.
 pub fn redact_option(value: &Option<String>) -> String {
     match value {
-        Some(_) => format!("Some({})", REDACTED),
+        Some(_) => format!("Some({REDACTED})"),
         None => "None".to_string(),
     }
 }
@@ -32,7 +32,10 @@ mod tests {
 
     #[test]
     fn redact_option_handles_some_and_none() {
-        assert_eq!(redact_option(&Some("secret".to_string())), "Some(<redacted>)");
+        assert_eq!(
+            redact_option(&Some("secret".to_string())),
+            "Some(<redacted>)"
+        );
         assert_eq!(redact_option(&None), "None");
     }
 }

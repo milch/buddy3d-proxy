@@ -10,9 +10,9 @@ pub struct Pkce {
 
 impl Pkce {
     pub fn generate() -> Self {
-        use rand::RngCore;
+        use rand::RngExt;
         let mut bytes = [0u8; 64];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill(&mut bytes);
         let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         let digest = Sha256::digest(verifier.as_bytes());
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);

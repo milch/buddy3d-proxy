@@ -98,11 +98,14 @@ impl RateLimiter {
         }
     }
 
-    #[cfg(test)]
     pub async fn tokens(&self) -> u32 {
         let mut inner = self.inner.lock().await;
         self.tick(&mut inner);
         inner.tokens
+    }
+
+    pub fn cap(&self) -> u32 {
+        self.cap
     }
 }
 

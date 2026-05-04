@@ -81,3 +81,18 @@ ci: fmt-check lint test
 # Hit the local /healthz endpoint (default HEALTH_PORT=8080).
 healthz:
     curl -i http://localhost:8080/healthz
+
+# Build the local Docker image (single-arch, host platform).
+docker-build:
+    docker build -t buddy3d-proxy:local .
+
+# Run the local Docker image, hot-mounting .env and a local /data volume.
+# Use this to validate the container actually starts; for full streaming
+# tests, use `just serve` directly (no Docker round-trip).
+docker-run: docker-build
+    docker run --rm \
+        --env-file .env \
+        -v "$(pwd)/data:/data" \
+        -p 8554:8554 \
+        -p 8080:8080 \
+        buddy3d-proxy:local

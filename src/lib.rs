@@ -4,6 +4,7 @@ pub mod health;
 pub mod jwt;
 pub mod live_outbound;
 pub mod metrics;
+pub mod mqtt;
 pub mod pkce;
 pub mod prusa;
 pub mod proto;

@@ -71,6 +71,9 @@ struct SupervisorInner {
     /// it flips to `true` — used by the auth orchestrator to signal that
     /// further reconnect attempts will keep failing with `LoginRejected`.
     failed_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Last published state. The MQTT state-watcher subscribes to this to
+    /// publish only on transitions, not on steady-state polls.
+    state_watch: tokio::sync::watch::Sender<State>,
 }
 
 struct SessionState {
@@ -93,6 +96,7 @@ impl Supervisor {
         failed_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Arc<Self> {
         let (viewer_tx, viewer_rx) = mpsc::channel(32);
+        let (state_watch, _) = tokio::sync::watch::channel(State::Idle);
         let inner = Arc::new(SupervisorInner {
             factory,
             camera_name,
@@ -110,6 +114,7 @@ impl Supervisor {
             last_error_at: Mutex::new(None),
             session_started_at: Mutex::new(None),
             failed_rx,
+            state_watch,
         });
 
         // Spawn the viewer-event loop (handles idle timer + tear-down).
@@ -132,6 +137,21 @@ impl Supervisor {
             session_uptime_secs: session_started_at.map(|t| t.elapsed().as_secs()),
             last_error_age_secs: last_error_at.map(|t| t.elapsed().as_secs()),
         }
+    }
+
+    /// Returns a fresh broadcast receiver for the current session's RTP
+    /// stream, or `None` if no session is active. Does NOT increment the
+    /// viewer count — intended for passive consumers like the snapshot
+    /// worker, which must not keep the session warm by itself.
+    pub async fn subscribe_rtp(&self) -> Option<tokio::sync::broadcast::Receiver<RtpPacket>> {
+        let state = self.inner.state.lock().await;
+        state.rtp_tx.as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Returns a watch receiver that fires whenever the supervisor's state
+    /// changes. The MQTT state publisher subscribes to this.
+    pub fn state_changes(&self) -> tokio::sync::watch::Receiver<State> {
+        self.inner.state_watch.subscribe()
     }
 }
 
@@ -156,6 +176,7 @@ impl StreamSource for Supervisor {
             let mut state = self.inner.state.lock().await;
             if matches!(state.state, State::Idle) {
                 state.state = State::Connecting;
+                let _ = self.inner.state_watch.send(State::Connecting);
                 // Drop the lock while we connect — we don't want to block other
                 // viewers' subscribe() calls if they race.
                 drop(state);
@@ -174,6 +195,7 @@ impl StreamSource for Supervisor {
 
                 let mut state = self.inner.state.lock().await;
                 state.state = State::Streaming;
+                let _ = self.inner.state_watch.send(State::Streaming);
                 state.rtp_tx = Some(broadcast_tx.clone());
                 state.stop = Some(stop);
                 let _ = state.h264.set(h264_params);
@@ -283,6 +305,7 @@ async fn reconnect_watchdog(
                     }
                     state.stop = Some(stop);
                     state.state = State::Streaming;
+                    let _ = inner.state_watch.send(State::Streaming);
                     drop(state);
                     *inner.session_started_at.lock().await = Some(std::time::Instant::now());
                     inner.wss_reconnects_total.fetch_add(1, Ordering::SeqCst);
@@ -339,6 +362,7 @@ async fn teardown_session(inner: &Arc<SupervisorInner>) {
         state.stop = None; // Drop = stop signal.
         state.rtp_tx = None;
         state.state = State::Idle;
+        let _ = inner.state_watch.send(State::Idle);
         // Reset the h264 cell so next connect can set fresh params.
         state.h264 = OnceCell::new();
     }
@@ -519,5 +543,56 @@ mod tests {
         // Reattach should reuse the existing session.
         let _sub2 = sup.subscribe().await.unwrap();
         assert_eq!(connects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscribe_rtp_returns_none_when_idle() {
+        let connects = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(StubFactory { connects });
+        let sup = Supervisor::new(
+            factory,
+            "Cam".into(),
+            "cam".into(),
+            Duration::from_secs(60),
+            None,
+        );
+        assert!(sup.subscribe_rtp().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscribe_rtp_returns_some_while_streaming() {
+        let connects = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(StubFactory { connects });
+        let sup = Supervisor::new(
+            factory,
+            "Cam".into(),
+            "cam".into(),
+            Duration::from_secs(60),
+            None,
+        );
+        let _sub = sup.subscribe().await.unwrap();
+        assert!(sup.subscribe_rtp().await.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn state_changes_fires_on_transitions() {
+        let connects = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(StubFactory { connects });
+        let sup = Supervisor::new(
+            factory,
+            "Cam".into(),
+            "cam".into(),
+            Duration::from_secs(60),
+            None,
+        );
+        let mut rx = sup.state_changes();
+        let _sub = sup.subscribe().await.unwrap();
+        rx.changed().await.unwrap();
+        let mut last = *rx.borrow();
+        if last != State::Streaming {
+            rx.changed().await.unwrap();
+            last = *rx.borrow();
+        }
+        assert_eq!(last, State::Streaming);
     }
 }

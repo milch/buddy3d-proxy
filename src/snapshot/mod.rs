@@ -5,23 +5,33 @@
 pub mod encode;
 pub mod h264;
 
-use crate::rtsp::sdp::H264Params;
 use crate::supervisor::{State, Supervisor};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// Latest decoder-relevant NAL units captured from the live RTP stream.
+/// Prusa's camera doesn't ship SPS/PPS via SDP `sprop-parameter-sets` —
+/// it sends them in-band as NAL units (type 7 and 8) right before each
+/// IDR keyframe (typically packaged in a STAP-A). The snapshot worker
+/// consumes them from here.
+#[derive(Default, Debug)]
+struct LatestParams {
+    sps: Option<Bytes>,
+    pps: Option<Bytes>,
+    idr: Option<Bytes>,
+}
+
 /// Spawn the snapshot worker. It subscribes to the supervisor's RTP
 /// broadcast on every state-transition into `Streaming`, runs the
-/// reassembler, and ticks every `interval` to publish the latest IDR
-/// (decoded to JPEG) via `publish`.
+/// reassembler to capture SPS/PPS/IDR NAL units, and ticks every
+/// `interval` to publish the latest IDR (decoded to JPEG) via `publish`.
 ///
 /// `interval` of `Duration::ZERO` disables snapshot publishing entirely.
 pub async fn run(
     supervisor: Arc<Supervisor>,
     interval: Duration,
-    sps_pps: Arc<Mutex<Option<(Bytes, Bytes)>>>,
     publish: impl Fn(Bytes) + Send + Sync + 'static,
 ) {
     if interval.is_zero() {
@@ -31,7 +41,7 @@ pub async fn run(
 
     let publish = Arc::new(publish);
     let mut state_rx = supervisor.state_changes();
-    let latest_idr: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+    let latest: Arc<Mutex<LatestParams>> = Arc::new(Mutex::new(LatestParams::default()));
     let mut current_session: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
@@ -40,13 +50,13 @@ pub async fn run(
         if snap.state == State::Streaming {
             if current_session.as_ref().map_or(true, |h| h.is_finished()) {
                 if let Some(rx) = supervisor.subscribe_rtp().await {
-                    let latest_for_consumer = latest_idr.clone();
+                    let latest_for_consumer = latest.clone();
                     current_session = Some(tokio::spawn(consume_rtp(rx, latest_for_consumer)));
                 }
             }
         } else if let Some(h) = current_session.take() {
             h.abort();
-            *latest_idr.lock().await = None;
+            *latest.lock().await = LatestParams::default();
         }
 
         tokio::select! {
@@ -55,14 +65,29 @@ pub async fn run(
             }
             _ = tokio::time::sleep(interval) => {
                 if matches!(supervisor.snapshot().await.state, State::Streaming) {
-                    let idr = latest_idr.lock().await.clone();
-                    let params = sps_pps.lock().await.clone();
-                    if let (Some(idr_bytes), Some((sps, pps))) = (idr, params) {
+                    let g = latest.lock().await;
+                    let triple = match (g.sps.clone(), g.pps.clone(), g.idr.clone()) {
+                        (Some(s), Some(p), Some(i)) => Some((s, p, i)),
+                        _ => {
+                            tracing::debug!(
+                                have_sps = g.sps.is_some(),
+                                have_pps = g.pps.is_some(),
+                                have_idr = g.idr.is_some(),
+                                "snapshot tick: missing NAL units; will retry next tick"
+                            );
+                            None
+                        }
+                    };
+                    drop(g);
+                    if let Some((sps, pps, idr)) = triple {
                         let publish = publish.clone();
                         tokio::task::spawn_blocking(move || {
-                            let annex_b = encode::build_annex_b(&sps, &pps, &idr_bytes);
+                            let annex_b = encode::build_annex_b(&sps, &pps, &idr);
                             match encode::decode_to_jpeg(&annex_b) {
-                                Ok(jpeg) => publish(jpeg),
+                                Ok(jpeg) => {
+                                    tracing::debug!(bytes = jpeg.len(), "snapshot encoded");
+                                    publish(jpeg);
+                                }
                                 Err(e) => tracing::warn!(error = %e, "snapshot decode failed"),
                             }
                         });
@@ -75,16 +100,44 @@ pub async fn run(
 
 async fn consume_rtp(
     mut rx: tokio::sync::broadcast::Receiver<webrtc::rtp::packet::Packet>,
-    latest_idr: Arc<Mutex<Option<Bytes>>>,
+    latest: Arc<Mutex<LatestParams>>,
 ) {
     let mut reassembler = h264::Reassembler::new();
+    let mut seen_sps = false;
+    let mut seen_pps = false;
+    let mut seen_idr = false;
     loop {
         match rx.recv().await {
             Ok(pkt) => {
                 let nals = reassembler.push(&pkt.payload, pkt.header.sequence_number);
+                if nals.is_empty() {
+                    continue;
+                }
+                let mut g = latest.lock().await;
                 for nal in nals {
-                    if nal.is_idr() {
-                        *latest_idr.lock().await = Some(nal.data);
+                    match nal.unit_type() {
+                        7 => {
+                            if !seen_sps {
+                                tracing::debug!(bytes = nal.data.len(), "snapshot: first SPS captured");
+                                seen_sps = true;
+                            }
+                            g.sps = Some(nal.data);
+                        }
+                        8 => {
+                            if !seen_pps {
+                                tracing::debug!(bytes = nal.data.len(), "snapshot: first PPS captured");
+                                seen_pps = true;
+                            }
+                            g.pps = Some(nal.data);
+                        }
+                        5 => {
+                            if !seen_idr {
+                                tracing::debug!(bytes = nal.data.len(), "snapshot: first IDR captured");
+                                seen_idr = true;
+                            }
+                            g.idr = Some(nal.data);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -94,54 +147,5 @@ async fn consume_rtp(
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
-    }
-}
-
-/// Helper for the orchestrator caller: extract SPS + PPS bytes from a
-/// negotiated `H264Params` (sprop-parameter-sets is base64-encoded
-/// comma-separated parameter sets). Returns (sps, pps). Returns `None`
-/// if the params don't decode to exactly two NALs.
-pub fn extract_sps_pps(params: &H264Params) -> Option<(Bytes, Bytes)> {
-    use base64::Engine;
-    let engine = base64::engine::general_purpose::STANDARD;
-    let sets: Vec<_> = params
-        .sprop_parameter_sets
-        .split(',')
-        .filter_map(|s| engine.decode(s).ok())
-        .collect();
-    if sets.len() != 2 {
-        return None;
-    }
-    Some((Bytes::from(sets[0].clone()), Bytes::from(sets[1].clone())))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rtsp::sdp::H264Params;
-
-    #[test]
-    fn extract_sps_pps_decodes_two_base64_parameter_sets() {
-        let params = H264Params {
-            profile_level_id: "42c01e".into(),
-            // Z0LAHto= decodes to 5 bytes (SPS), aM44gA== decodes to 4 bytes (PPS)
-            sprop_parameter_sets: "Z0LAHto=,aM44gA==".into(),
-            packetization_mode: 1,
-            payload_type: 96,
-        };
-        let (sps, pps) = extract_sps_pps(&params).expect("decode");
-        assert_eq!(sps.len(), 5);
-        assert_eq!(pps.len(), 4);
-    }
-
-    #[test]
-    fn extract_sps_pps_returns_none_on_malformed() {
-        let params = H264Params {
-            profile_level_id: "42c01e".into(),
-            sprop_parameter_sets: "not-base64".into(),
-            packetization_mode: 1,
-            payload_type: 96,
-        };
-        assert!(extract_sps_pps(&params).is_none());
     }
 }

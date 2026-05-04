@@ -436,28 +436,15 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
 
-                // Snapshot orchestrator. SPS/PPS are populated on each session
-                // connect from the supervisor's cached H264Params.
+                // Snapshot orchestrator. SPS/PPS/IDR are captured directly
+                // from in-band NAL units in the RTP stream (Prusa's camera
+                // doesn't ship parameter sets via SDP `sprop-parameter-sets`).
                 {
                     let hub = hub.clone();
                     let supervisor = supervisor.clone();
                     let interval = cfg.snapshot_interval;
-                    let sps_pps = std::sync::Arc::new(tokio::sync::Mutex::new(None));
-                    let sps_pps_for_refresh = sps_pps.clone();
-                    let supervisor_for_refresh = supervisor.clone();
                     tokio::spawn(async move {
-                        let mut rx = supervisor_for_refresh.state_changes();
-                        loop {
-                            if rx.changed().await.is_err() { return; }
-                            if let Some(h) = supervisor_for_refresh.cached_h264_params().await {
-                                if let Some(pair) = snapshot::extract_sps_pps(&h) {
-                                    *sps_pps_for_refresh.lock().await = Some(pair);
-                                }
-                            }
-                        }
-                    });
-                    tokio::spawn(async move {
-                        snapshot::run(supervisor, interval, sps_pps, move |jpeg| {
+                        snapshot::run(supervisor, interval, move |jpeg| {
                             let hub = hub.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = hub.publish_snapshot(jpeg).await {

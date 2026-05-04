@@ -257,12 +257,43 @@ async fn main() -> anyhow::Result<()> {
             });
             let supervisor = Supervisor::new(
                 factory,
-                camera_name,
+                camera_name.clone(),
                 rtsp_path.clone(),
                 cfg.idle_timeout,
             );
 
-            let _handle = Server::start(&cfg.rtsp_bind_addr, cfg.rtsp_port, supervisor)
+            // Spawn /healthz on 0.0.0.0:health_port, fed by the auth orchestrator's
+            // failed sentinel.
+            {
+                let failed_rx = orch.failed_watch();
+                let health_addr = std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    cfg.health_port,
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = buddy3d_proxy::health::serve(health_addr, failed_rx).await {
+                        tracing::error!(error = %e, "health server exited");
+                    }
+                });
+            }
+
+            // Spawn the periodic metrics emitter.
+            {
+                let supervisor_for_metrics = supervisor.clone();
+                let limiter_for_metrics = prusa.limiter();
+                let camera_name_for_metrics = camera_name.clone();
+                let interval = cfg.metrics_interval;
+                tokio::spawn(async move {
+                    buddy3d_proxy::metrics::run(
+                        camera_name_for_metrics,
+                        supervisor_for_metrics,
+                        limiter_for_metrics,
+                        interval,
+                    ).await;
+                });
+            }
+
+            let _handle = Server::start(&cfg.rtsp_bind_addr, cfg.rtsp_port, supervisor.clone())
                 .await
                 .context("rtsp server start")?;
 

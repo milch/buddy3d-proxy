@@ -32,6 +32,14 @@ impl PrusaClient {
         Self { inner, limiter }
     }
 
+    /// Cheap clone of the shared rate limiter — used by the metrics emitter
+    /// to read live token-bucket state. The `limiter` field is `pub(crate)`,
+    /// which keeps the lib crate happy but isn't visible to the `main.rs`
+    /// binary crate, so this accessor exists for that callsite.
+    pub fn limiter(&self) -> Arc<RateLimiter> {
+        self.limiter.clone()
+    }
+
     pub fn request(&self, method: Method, url: Url) -> RequestBuilder {
         self.inner.request(method, url)
     }

@@ -13,6 +13,7 @@ pub struct Config {
     pub idle_timeout: Duration,
     pub token_store_path: PathBuf,
     pub health_port: u16,
+    pub metrics_interval: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +55,7 @@ impl Config {
             idle_timeout: Duration::from_secs(parse_u64("IDLE_TIMEOUT_SECONDS", 60)?),
             token_store_path: opt("TOKEN_STORE_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/data/tokens.json")),
             health_port: parse_u16("HEALTH_PORT", 8080)?,
+            metrics_interval: Duration::from_secs(parse_u64("METRICS_INTERVAL_SECONDS", 60)?),
         })
     }
 }
@@ -75,6 +77,7 @@ mod tests {
         "IDLE_TIMEOUT_SECONDS",
         "TOKEN_STORE_PATH",
         "HEALTH_PORT",
+        "METRICS_INTERVAL_SECONDS",
     ];
 
     fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
@@ -114,6 +117,7 @@ mod tests {
             assert_eq!(cfg.rtsp_port, 8554);
             assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
             assert_eq!(cfg.health_port, 8080);
+            assert_eq!(cfg.metrics_interval, Duration::from_secs(60));
             assert_eq!(cfg.token_store_path, PathBuf::from("/data/tokens.json"));
         });
     }

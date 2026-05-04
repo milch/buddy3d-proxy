@@ -77,3 +77,7 @@ set-mode mode="1":
 
 # Format + lint + test, in that order. Run before pushing.
 ci: fmt-check lint test
+
+# Hit the local /healthz endpoint (default HEALTH_PORT=8080).
+healthz:
+    curl -i http://localhost:8080/healthz

@@ -1,0 +1,23 @@
+# Build artifacts — would otherwise upload many GB
+target/
+
+# Local secrets — must NEVER be in image layers
+.env
+tokens.json
+
+# VCS state — not needed inside the build, can be huge
+.git/
+
+# Project docs and reverse-engineering corpus — not needed for the build
+docs/
+api/
+PLAN.md
+README.md
+
+# IDE / editor scratch
+.idea/
+.vscode/
+*.swp
+
+# OS scratch
+.DS_Store

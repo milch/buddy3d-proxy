@@ -29,9 +29,14 @@ struct LatestParams {
 /// `interval` to publish the latest IDR (decoded to JPEG) via `publish`.
 ///
 /// `interval` of `Duration::ZERO` disables snapshot publishing entirely.
+/// `max_width` caps the JPEG width (downscaled with aspect ratio
+/// preserved). `jpeg_quality` is 1..=100. Both control the published JPEG
+/// size to stay under whatever per-message limit the MQTT broker enforces.
 pub async fn run(
     supervisor: Arc<Supervisor>,
     interval: Duration,
+    max_width: u32,
+    jpeg_quality: u8,
     publish: impl Fn(Bytes) + Send + Sync + 'static,
 ) {
     if interval.is_zero() {
@@ -83,7 +88,7 @@ pub async fn run(
                         let publish = publish.clone();
                         tokio::task::spawn_blocking(move || {
                             let annex_b = encode::build_annex_b(&sps, &pps, &idr);
-                            match encode::decode_to_jpeg(&annex_b) {
+                            match encode::decode_to_jpeg(&annex_b, max_width, jpeg_quality) {
                                 Ok(jpeg) => {
                                     tracing::debug!(bytes = jpeg.len(), "snapshot encoded");
                                     publish(jpeg);

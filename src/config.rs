@@ -21,6 +21,8 @@ pub struct Config {
     pub mqtt_discovery_prefix: String,
     pub mqtt_topic_prefix: String,
     pub snapshot_interval: Duration,
+    pub snapshot_max_width: u32,
+    pub snapshot_jpeg_quality: u8,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +48,18 @@ impl Config {
             }
         }
         fn parse_u64(k: &'static str, default: u64) -> Result<u64, ConfigError> {
+            match std::env::var(k).ok() {
+                Some(v) => v.parse().map_err(|e: std::num::ParseIntError| ConfigError::Invalid(k, e.to_string())),
+                None => Ok(default),
+            }
+        }
+        fn parse_u32(k: &'static str, default: u32) -> Result<u32, ConfigError> {
+            match std::env::var(k).ok() {
+                Some(v) => v.parse().map_err(|e: std::num::ParseIntError| ConfigError::Invalid(k, e.to_string())),
+                None => Ok(default),
+            }
+        }
+        fn parse_u8(k: &'static str, default: u8) -> Result<u8, ConfigError> {
             match std::env::var(k).ok() {
                 Some(v) => v.parse().map_err(|e: std::num::ParseIntError| ConfigError::Invalid(k, e.to_string())),
                 None => Ok(default),
@@ -106,6 +120,8 @@ impl Config {
             mqtt_discovery_prefix: opt("MQTT_DISCOVERY_PREFIX").unwrap_or_else(|| "homeassistant".into()),
             mqtt_topic_prefix: opt("MQTT_TOPIC_PREFIX").unwrap_or_else(|| "buddy3d-proxy".into()),
             snapshot_interval: Duration::from_secs(parse_u64("SNAPSHOT_INTERVAL_SECONDS", 10)?),
+            snapshot_max_width: parse_u32("SNAPSHOT_MAX_WIDTH", 1920)?,
+            snapshot_jpeg_quality: parse_u8("SNAPSHOT_JPEG_QUALITY", 75)?,
         })
     }
 }
@@ -135,6 +151,8 @@ mod tests {
         "MQTT_DISCOVERY_PREFIX",
         "MQTT_TOPIC_PREFIX",
         "SNAPSHOT_INTERVAL_SECONDS",
+        "SNAPSHOT_MAX_WIDTH",
+        "SNAPSHOT_JPEG_QUALITY",
     ];
 
     fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
@@ -180,6 +198,8 @@ mod tests {
             assert_eq!(cfg.mqtt_discovery_prefix, "homeassistant");
             assert_eq!(cfg.mqtt_topic_prefix, "buddy3d-proxy");
             assert_eq!(cfg.snapshot_interval, Duration::from_secs(10));
+            assert_eq!(cfg.snapshot_max_width, 1920);
+            assert_eq!(cfg.snapshot_jpeg_quality, 75);
         });
     }
 

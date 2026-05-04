@@ -443,8 +443,10 @@ async fn main() -> anyhow::Result<()> {
                     let hub = hub.clone();
                     let supervisor = supervisor.clone();
                     let interval = cfg.snapshot_interval;
+                    let max_width = cfg.snapshot_max_width;
+                    let quality = cfg.snapshot_jpeg_quality;
                     tokio::spawn(async move {
-                        snapshot::run(supervisor, interval, move |jpeg| {
+                        snapshot::run(supervisor, interval, max_width, quality, move |jpeg| {
                             let hub = hub.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = hub.publish_snapshot(jpeg).await {

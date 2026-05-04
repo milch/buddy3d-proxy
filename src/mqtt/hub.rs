@@ -40,6 +40,10 @@ impl Hub {
 
         let mut opts = MqttOptions::new(cfg.client_id, host, port);
         opts.set_keep_alive(Duration::from_secs(30));
+        // rumqttc's default max_packet_size is 10 KiB, which silently kills
+        // any non-trivial JPEG snapshot publish. Bump to 4 MiB; HA's bundled
+        // Mosquitto default is 256 MiB so the broker side is never the bind.
+        opts.set_max_packet_size(4 * 1024 * 1024, 4 * 1024 * 1024);
         if let (Some(u), Some(p)) = (cfg.username.as_deref(), cfg.password.as_deref()) {
             opts.set_credentials(u, p);
         }

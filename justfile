@@ -96,3 +96,36 @@ docker-run: docker-build
         -p 8554:8554 \
         -p 8080:8080 \
         buddy3d-proxy:local
+
+# Bump the package version (major | minor | patch), commit Cargo.{toml,lock},
+# and tag the commit. Prints the command to push the tag to origin.
+bump level:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{level}}" in
+        major|minor|patch) ;;
+        *) echo "usage: just bump [major|minor|patch]" >&2; exit 1 ;;
+    esac
+    current=$(sed -nE 's/^version = "([^"]+)"$/\1/p' Cargo.toml | head -1)
+    if [[ -z "$current" ]]; then
+        echo "couldn't find package version in Cargo.toml" >&2
+        exit 1
+    fi
+    IFS='.' read -r major minor patch <<< "$current"
+    case "{{level}}" in
+        major) new="$((major + 1)).0.0" ;;
+        minor) new="$major.$((minor + 1)).0" ;;
+        patch) new="$major.$minor.$((patch + 1))" ;;
+    esac
+    echo "bumping $current → $new"
+    sed -i.bak -E "s/^version = \"$current\"$/version = \"$new\"/" Cargo.toml
+    rm Cargo.toml.bak
+    # Refresh Cargo.lock so it carries the new version.
+    cargo check --quiet
+    git add Cargo.toml Cargo.lock
+    git commit -m "chore: bump version to v$new"
+    git tag "v$new"
+    branch=$(git symbolic-ref --short HEAD)
+    echo
+    echo "tagged v$new on $branch. to push:"
+    echo "  git push origin $branch && git push origin v$new"

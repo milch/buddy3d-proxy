@@ -41,12 +41,12 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 webrtc = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
-rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
-openh264 = "0.6"
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"] }
+openh264 = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
-rumqttd = "0.19"
+rumqttd = "0.20"

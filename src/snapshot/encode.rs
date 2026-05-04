@@ -54,7 +54,7 @@ pub fn decode_to_jpeg(annex_b: &[u8], max_width: u32, quality: u8) -> Result<Byt
         .ok_or(EncodeError::NoFrame)?;
 
     let (width, height) = frame.dimensions();
-    let mut rgb = vec![0u8; frame.estimate_rgb_u8_size()];
+    let mut rgb = vec![0u8; frame.rgb8_len()];
     frame.write_rgb8(&mut rgb);
 
     let img = RgbImage::from_raw(width as u32, height as u32, rgb).ok_or(

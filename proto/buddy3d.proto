@@ -155,19 +155,31 @@ message StatusFlags {
   uint32 field1 = 1;  // observed: 1
 }
 
+// ── StreamConfig ──────────────────────────────────────────────────────────
+// Current stream configuration the camera is running with. Embedded as
+// CameraCapabilities.field6. Same enum encodings as the outbound
+// `set_mode` / `set_quality` Configuration events (see commands.rs):
+//   mode: 1=Auto, 2=Day, 3=Night
+//   quality: 1=SD, 2=HD, 3=FHD
+message StreamConfig {
+  uint32 mode     = 1;       // current IR / day-night mode
+  uint32 quality  = 2;       // current video resolution
+  string rtsp_url = 3;       // local RTSP URL on the camera, e.g. "rtsp://10.99.50.34/live"
+}
+
 // ── CameraCapabilities ────────────────────────────────────────────────────
 // Camera firmware and capability details (Status.field5, 176 bytes).
 // Internal submessages still partially opaque; kept as bytes for now.
 message CameraCapabilities {
-  string fw_version   = 1;   // "3.1.4"
-  string hw_version   = 2;   // "NB.1.1.0"
-  string camera_name  = 3;   // "Buddy3D Camera"
-  bytes  opaque_f4    = 4;   // observed: varint(2), str("UNKNOWN") — profile/type flags
+  string fw_version          = 1;   // "3.1.4"
+  string hw_version          = 2;   // "NB.1.1.0"
+  string camera_name         = 3;   // "Buddy3D Camera"
+  bytes  opaque_f4           = 4;   // observed: varint(2), str("UNKNOWN") — profile/type flags
   // field 5 not observed
-  bytes  opaque_f6    = 6;   // observed: varint(3), varint(2), str("rtsp://...") — stream config
-  bytes  opaque_f7    = 7;   // observed: varint(2) — flags
+  StreamConfig stream_config = 6;   // current mode + quality + RTSP URL
+  bytes  opaque_f7           = 7;   // observed: varint(2) — flags
   // field 8 not observed
-  bytes  opaque_f9    = 9;   // three strings: connect/signaling/ota hostnames
+  bytes  opaque_f9           = 9;   // three strings: connect/signaling/ota hostnames
 }
 
 // ── Status ────────────────────────────────────────────────────────────────

@@ -29,6 +29,10 @@ pub struct WebRtcFactory {
     /// over the live signaling channel without bringing up a transient connection.
     /// Populated on every successful connect; cleared on session tear-down.
     pub live_outbound: crate::live_outbound::LiveOutbound,
+    /// Long-lived watch carrying the camera's current `Status` event. Updated
+    /// on every session bring-up so the MQTT subsystem can publish the
+    /// camera's actual current mode + quality (vs. assuming defaults).
+    pub camera_status: Arc<crate::live_outbound::CameraStatusWatch>,
 }
 
 #[async_trait::async_trait]
@@ -47,10 +51,11 @@ impl StreamFactory for WebRtcFactory {
             .await
             .map_err(|e| SourceError::Unavailable(format!("webrtc-config: {e}")))?;
 
-        let signaling = PrusaSignaling::connect(
+        let signaling = PrusaSignaling::connect_with_status_sink(
             self.camera.token.clone(),
             token.clone(),
             webrtc_cfg.clone(),
+            Some(self.camera_status.clone()),
         )
         .await
         .map_err(|e| SourceError::Unavailable(format!("signaling: {e}")))?;

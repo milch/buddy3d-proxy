@@ -223,6 +223,24 @@ pub struct StatusFlags {
     #[prost(uint32, tag = "1")]
     pub field1: u32,
 }
+/// ── StreamConfig ──────────────────────────────────────────────────────────
+/// Current stream configuration the camera is running with. Embedded as
+/// CameraCapabilities.field6. Same enum encodings as the outbound
+/// `set_mode` / `set_quality` Configuration events (see commands.rs):
+///    mode: 1=Auto, 2=Day, 3=Night
+///    quality: 1=SD, 2=HD, 3=FHD
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StreamConfig {
+    /// current IR / day-night mode
+    #[prost(uint32, tag = "1")]
+    pub mode: u32,
+    /// current video resolution
+    #[prost(uint32, tag = "2")]
+    pub quality: u32,
+    /// local RTSP URL on the camera, e.g. "rtsp://10.99.50.34/live"
+    #[prost(string, tag = "3")]
+    pub rtsp_url: ::prost::alloc::string::String,
+}
 /// ── CameraCapabilities ────────────────────────────────────────────────────
 /// Camera firmware and capability details (Status.field5, 176 bytes).
 /// Internal submessages still partially opaque; kept as bytes for now.
@@ -242,9 +260,9 @@ pub struct CameraCapabilities {
     pub opaque_f4: ::prost::alloc::vec::Vec<u8>,
     /// field 5 not observed
     ///
-    /// observed: varint(3), varint(2), str("rtsp://...") — stream config
-    #[prost(bytes = "vec", tag = "6")]
-    pub opaque_f6: ::prost::alloc::vec::Vec<u8>,
+    /// current mode + quality + RTSP URL
+    #[prost(message, optional, tag = "6")]
+    pub stream_config: ::core::option::Option<StreamConfig>,
     /// observed: varint(2) — flags
     #[prost(bytes = "vec", tag = "7")]
     pub opaque_f7: ::prost::alloc::vec::Vec<u8>,

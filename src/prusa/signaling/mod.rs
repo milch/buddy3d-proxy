@@ -60,6 +60,20 @@ impl PrusaSignaling {
         access_jwt: String,
         webrtc_cfg: crate::prusa::api::WebRtcConfig,
     ) -> Result<Self, SignalingError> {
+        Self::connect_with_status_sink(camera_token, access_jwt, webrtc_cfg, None).await
+    }
+
+    /// Same as `connect`, but also forwards every parsed `Status` event to
+    /// the supplied watch sender. Used by the supervisor to surface the
+    /// camera's current mode/quality to the MQTT subsystem on each session
+    /// connect. We take an `Arc` because `watch::Sender` is not `Clone` —
+    /// the sender lives on `WebRtcFactory` and is shared across sessions.
+    pub async fn connect_with_status_sink(
+        camera_token: String,
+        access_jwt: String,
+        webrtc_cfg: crate::prusa::api::WebRtcConfig,
+        status_sink: Option<std::sync::Arc<tokio::sync::watch::Sender<Option<crate::proto::Status>>>>,
+    ) -> Result<Self, SignalingError> {
         let (outbound, mut raw_events) = client::connect(SIGNALING_URL).await?;
 
         // Send Engine.IO MESSAGE → Socket.IO CONNECT (`40{...}`) with the
@@ -124,7 +138,13 @@ impl PrusaSignaling {
             // Main event-translation loop.
             while let Some(ev) = raw_events.recv().await {
                 let translated = match ev {
-                    Inbound::BinaryEvent { name, payload } => translate_binary(&name, payload),
+                    Inbound::BinaryEvent { name, payload } => {
+                        let ev = translate_binary(&name, payload);
+                        if let (Some(sink), SignalingEvent::Status(s)) = (&status_sink, &ev) {
+                            let _ = sink.send(Some(s.clone()));
+                        }
+                        ev
+                    }
                     Inbound::Ack { id, payload } => {
                         if !auth_acked && id == 0 {
                             // payload is `[0]` for success in this protocol.

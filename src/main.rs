@@ -266,11 +266,13 @@ async fn main() -> anyhow::Result<()> {
             );
 
             let live_outbound = buddy3d_proxy::live_outbound::empty();
+            let camera_status = buddy3d_proxy::live_outbound::camera_status_watch();
             let factory = Arc::new(WebRtcFactory {
                 orch: orch.clone(),
                 prusa: prusa.clone(),
                 camera,
                 live_outbound: live_outbound.clone(),
+                camera_status: camera_status.clone(),
             });
             let _live_outbound = live_outbound;
             let supervisor = Supervisor::new(
@@ -380,21 +382,43 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
 
-                // Auto-FHD echo: the WebRtcFactory sets quality=FHD on every
-                // session connect. Publish that to MQTT so HA's quality select
-                // doesn't show "unknown" until the user touches it.
+                // Camera-status watcher: publishes mode + quality from the
+                // `Status` event the camera emits on every signaling session
+                // connect. The state values come from
+                // `Status.capabilities.stream_config.{mode,quality}`. Note
+                // that the WebRtcFactory's auto-FHD post-connect path resets
+                // quality to FHD shortly after the Status event lands, so
+                // briefly published value (e.g. HD) gets overwritten by the
+                // camera's next Status — the eventual published value is FHD.
                 {
                     let hub = hub.clone();
-                    let supervisor = supervisor.clone();
+                    let mut rx = camera_status.subscribe();
                     tokio::spawn(async move {
-                        let mut rx = supervisor.state_changes();
-                        loop {
-                            if rx.changed().await.is_err() {
-                                return;
+                        while rx.changed().await.is_ok() {
+                            let snapshot = rx.borrow().clone();
+                            let Some(status) = snapshot else { continue };
+                            let Some(caps) = status.capabilities else { continue };
+                            let Some(cfg) = caps.stream_config else { continue };
+                            let mode = match cfg.mode {
+                                1 => Some("Auto"),
+                                2 => Some("Day"),
+                                3 => Some("Night"),
+                                _ => None,
+                            };
+                            let quality = match cfg.quality {
+                                1 => Some("SD"),
+                                2 => Some("HD"),
+                                3 => Some("FHD"),
+                                _ => None,
+                            };
+                            if let Some(m) = mode {
+                                if let Err(e) = hub.publish_mode_state(m).await {
+                                    tracing::warn!(error = %e, mode = %m, "publish mode failed");
+                                }
                             }
-                            if matches!(*rx.borrow(), buddy3d_proxy::supervisor::State::Streaming) {
-                                if let Err(e) = hub.publish_quality_state("FHD").await {
-                                    tracing::warn!(error = %e, "publish quality=FHD failed");
+                            if let Some(q) = quality {
+                                if let Err(e) = hub.publish_quality_state(q).await {
+                                    tracing::warn!(error = %e, quality = %q, "publish quality failed");
                                 }
                             }
                         }

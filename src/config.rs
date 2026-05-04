@@ -14,6 +14,13 @@ pub struct Config {
     pub token_store_path: PathBuf,
     pub health_port: u16,
     pub metrics_interval: Duration,
+    pub mqtt_broker_url: Option<url::Url>,
+    pub mqtt_username: Option<String>,
+    pub mqtt_password: Option<String>,
+    pub mqtt_client_id: Option<String>,
+    pub mqtt_discovery_prefix: String,
+    pub mqtt_topic_prefix: String,
+    pub snapshot_interval: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +51,12 @@ impl Config {
                 None => Ok(default),
             }
         }
+        fn parse_url(k: &'static str) -> Result<Option<url::Url>, ConfigError> {
+            match std::env::var(k).ok().filter(|s| !s.is_empty()) {
+                Some(v) => Ok(Some(v.parse().map_err(|e: url::ParseError| ConfigError::Invalid(k, e.to_string()))?)),
+                None => Ok(None),
+            }
+        }
         Ok(Self {
             prusa_email: req("PRUSA_EMAIL")?,
             prusa_password: req("PRUSA_PASSWORD")?,
@@ -56,6 +69,13 @@ impl Config {
             token_store_path: opt("TOKEN_STORE_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/data/tokens.json")),
             health_port: parse_u16("HEALTH_PORT", 8080)?,
             metrics_interval: Duration::from_secs(parse_u64("METRICS_INTERVAL_SECONDS", 60)?),
+            mqtt_broker_url: parse_url("MQTT_BROKER_URL")?,
+            mqtt_username: opt("MQTT_USERNAME"),
+            mqtt_password: opt("MQTT_PASSWORD"),
+            mqtt_client_id: opt("MQTT_CLIENT_ID"),
+            mqtt_discovery_prefix: opt("MQTT_DISCOVERY_PREFIX").unwrap_or_else(|| "homeassistant".into()),
+            mqtt_topic_prefix: opt("MQTT_TOPIC_PREFIX").unwrap_or_else(|| "buddy3d-proxy".into()),
+            snapshot_interval: Duration::from_secs(parse_u64("SNAPSHOT_INTERVAL_SECONDS", 10)?),
         })
     }
 }
@@ -78,6 +98,13 @@ mod tests {
         "TOKEN_STORE_PATH",
         "HEALTH_PORT",
         "METRICS_INTERVAL_SECONDS",
+        "MQTT_BROKER_URL",
+        "MQTT_USERNAME",
+        "MQTT_PASSWORD",
+        "MQTT_CLIENT_ID",
+        "MQTT_DISCOVERY_PREFIX",
+        "MQTT_TOPIC_PREFIX",
+        "SNAPSHOT_INTERVAL_SECONDS",
     ];
 
     fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
@@ -119,6 +146,10 @@ mod tests {
             assert_eq!(cfg.health_port, 8080);
             assert_eq!(cfg.metrics_interval, Duration::from_secs(60));
             assert_eq!(cfg.token_store_path, PathBuf::from("/data/tokens.json"));
+            assert!(cfg.mqtt_broker_url.is_none());
+            assert_eq!(cfg.mqtt_discovery_prefix, "homeassistant");
+            assert_eq!(cfg.mqtt_topic_prefix, "buddy3d-proxy");
+            assert_eq!(cfg.snapshot_interval, Duration::from_secs(10));
         });
     }
 
@@ -139,5 +170,40 @@ mod tests {
         ], || {
             assert!(matches!(Config::from_env(), Err(ConfigError::Invalid("RTSP_PORT", _))));
         });
+    }
+
+    #[test]
+    fn parses_mqtt_broker_url_when_set() {
+        with_env(
+            &[
+                ("PRUSA_EMAIL", "u@e.com"),
+                ("PRUSA_PASSWORD", "p"),
+                ("MQTT_BROKER_URL", "mqtts://broker.local:8883"),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                let url = cfg.mqtt_broker_url.expect("url parsed");
+                assert_eq!(url.scheme(), "mqtts");
+                assert_eq!(url.host_str(), Some("broker.local"));
+                assert_eq!(url.port(), Some(8883));
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_mqtt_broker_url() {
+        with_env(
+            &[
+                ("PRUSA_EMAIL", "u@e.com"),
+                ("PRUSA_PASSWORD", "p"),
+                ("MQTT_BROKER_URL", "not a url"),
+            ],
+            || {
+                assert!(matches!(
+                    Config::from_env(),
+                    Err(ConfigError::Invalid("MQTT_BROKER_URL", _))
+                ));
+            },
+        );
     }
 }

@@ -65,7 +65,6 @@ struct SupervisorInner {
     /// Channel the RTSP server's Subscription Drop sends to.
     viewer_tx: mpsc::Sender<ViewerEvent>,
     pub wss_reconnects_total: std::sync::atomic::AtomicU64,
-    pub webrtc_renegotiations_total: std::sync::atomic::AtomicU64,
     pub last_error_at: Mutex<Option<std::time::Instant>>,
     pub session_started_at: Mutex<Option<std::time::Instant>>,
 }
@@ -103,7 +102,6 @@ impl Supervisor {
             }),
             viewer_tx,
             wss_reconnects_total: std::sync::atomic::AtomicU64::new(0),
-            webrtc_renegotiations_total: std::sync::atomic::AtomicU64::new(0),
             last_error_at: Mutex::new(None),
             session_started_at: Mutex::new(None),
         });
@@ -125,7 +123,6 @@ impl Supervisor {
             state: state.state,
             viewers: self.inner.viewer_count.load(Ordering::SeqCst).max(0) as u32,
             wss_reconnects_total: self.inner.wss_reconnects_total.load(Ordering::SeqCst),
-            webrtc_renegotiations_total: self.inner.webrtc_renegotiations_total.load(Ordering::SeqCst),
             session_uptime_secs: session_started_at.map(|t| t.elapsed().as_secs()),
             last_error_age_secs: last_error_at.map(|t| t.elapsed().as_secs()),
         }
@@ -137,7 +134,6 @@ pub struct SupervisorSnapshot {
     pub state: State,
     pub viewers: u32,
     pub wss_reconnects_total: u64,
-    pub webrtc_renegotiations_total: u64,
     pub session_uptime_secs: Option<u64>,
     pub last_error_age_secs: Option<u64>,
 }

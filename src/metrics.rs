@@ -24,7 +24,6 @@ pub async fn run(
             state = ?snap.state,
             viewers = snap.viewers,
             wss_reconnects_total = snap.wss_reconnects_total,
-            webrtc_renegotiations_total = snap.webrtc_renegotiations_total,
             prusa_5xx_bucket_now = bucket_now,
             prusa_5xx_bucket_cap = bucket_cap,
             last_error_age_s = snap.last_error_age_secs,

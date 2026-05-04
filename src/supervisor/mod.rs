@@ -12,8 +12,13 @@ use crate::rtsp::server::{SourceError, StreamSource, Subscription, ViewerEvent};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, Mutex, OnceCell};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, OnceCell};
 use webrtc::rtp::packet::Packet as RtpPacket;
+
+/// Fires once when the underlying session ends on its own (signaling drop,
+/// WebRTC ICE failure, peer-connection close from the camera side). Does NOT
+/// fire when the session is torn down via `StopHandle::Drop`.
+pub type SessionEnded = oneshot::Receiver<()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -34,7 +39,7 @@ pub trait StreamFactory: Send + Sync + 'static {
     async fn connect(
         &self,
         rtp_tx: broadcast::Sender<RtpPacket>,
-    ) -> Result<(H264Params, StopHandle), SourceError>;
+    ) -> Result<(H264Params, StopHandle, SessionEnded), SourceError>;
 }
 
 /// Drop to stop the underlying WebRTC + signaling session.
@@ -119,7 +124,7 @@ impl StreamSource for Supervisor {
                 // viewers' subscribe() calls if they race.
                 drop(state);
 
-                let (h264_params, stop, broadcast_tx) = match connect_session(&self.inner).await {
+                let (h264_params, stop, broadcast_tx, _ended) = match connect_session(&self.inner).await {
                     Ok(t) => t,
                     Err(e) => {
                         // Roll back the viewer count.
@@ -164,10 +169,10 @@ impl StreamSource for Supervisor {
 
 async fn connect_session(
     inner: &Arc<SupervisorInner>,
-) -> Result<(H264Params, StopHandle, broadcast::Sender<RtpPacket>), SourceError> {
+) -> Result<(H264Params, StopHandle, broadcast::Sender<RtpPacket>, SessionEnded), SourceError> {
     let (broadcast_tx, _) = broadcast::channel::<RtpPacket>(256);
-    let (h264, stop) = inner.factory.connect(broadcast_tx.clone()).await?;
-    Ok((h264, stop, broadcast_tx))
+    let (h264, stop, ended) = inner.factory.connect(broadcast_tx.clone()).await?;
+    Ok((h264, stop, broadcast_tx, ended))
 }
 
 async fn viewer_event_loop(inner: Arc<SupervisorInner>, mut rx: mpsc::Receiver<ViewerEvent>) {
@@ -230,8 +235,9 @@ mod tests {
         async fn connect(
             &self,
             _rtp_tx: broadcast::Sender<RtpPacket>,
-        ) -> Result<(H264Params, StopHandle), SourceError> {
+        ) -> Result<(H264Params, StopHandle, SessionEnded), SourceError> {
             self.connects.fetch_add(1, Ordering::SeqCst);
+            let (_tx, rx) = oneshot::channel();
             Ok((
                 H264Params {
                     profile_level_id: "42c01e".into(),
@@ -242,6 +248,7 @@ mod tests {
                 StopHandle {
                     kill: Box::new(()),
                 },
+                rx,
             ))
         }
     }

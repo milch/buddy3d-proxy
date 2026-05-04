@@ -32,7 +32,7 @@ impl StreamFactory for WebRtcFactory {
     async fn connect(
         &self,
         rtp_tx: broadcast::Sender<RtpPacket>,
-    ) -> Result<(H264Params, StopHandle), SourceError> {
+    ) -> Result<(H264Params, StopHandle, crate::supervisor::SessionEnded), SourceError> {
         let token = self
             .orch
             .access_token()
@@ -78,11 +78,15 @@ impl StreamFactory for WebRtcFactory {
         let camera_token_for_post_connect = self.camera.token.clone();
         let pc_for_post_connect = pc.clone();
 
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
+
         // Spawn the run_session driver. Stop when kill_rx fires or the
         // signaling channel closes.
         let driver_handle = tokio::spawn(async move {
             tokio::select! {
-                _ = run_session(signaling, &driver_session, signal_tx, signal_rx) => {}
+                _ = run_session(signaling, &driver_session, signal_tx, signal_rx) => {
+                    let _ = ended_tx.send(());
+                }
                 _ = &mut kill_rx => {
                     let _ = driver_session.close().await;
                 }
@@ -201,6 +205,7 @@ impl StreamFactory for WebRtcFactory {
             StopHandle {
                 kill: Box::new(joiner),
             },
+            ended_rx,
         ))
     }
 }

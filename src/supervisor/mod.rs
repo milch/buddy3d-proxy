@@ -153,6 +153,13 @@ impl Supervisor {
     pub fn state_changes(&self) -> tokio::sync::watch::Receiver<State> {
         self.inner.state_watch.subscribe()
     }
+
+    /// Returns the H.264 params from the most recent successful negotiation,
+    /// if any. Used by the snapshot subsystem to refresh SPS/PPS for decoding.
+    pub async fn cached_h264_params(&self) -> Option<crate::rtsp::sdp::H264Params> {
+        let state = self.inner.state.lock().await;
+        state.h264.get().cloned()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

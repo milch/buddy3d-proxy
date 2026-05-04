@@ -274,7 +274,7 @@ async fn main() -> anyhow::Result<()> {
             });
             let _live_outbound = live_outbound;
             let supervisor = Supervisor::new(
-                factory,
+                factory.clone(),
                 camera_name.clone(),
                 rtsp_path.clone(),
                 cfg.idle_timeout,
@@ -310,6 +310,109 @@ async fn main() -> anyhow::Result<()> {
                         interval,
                     ).await;
                 });
+            }
+
+            // MQTT subsystem (opt-in).
+            if let Some(broker_url) = cfg.mqtt_broker_url.clone() {
+                use buddy3d_proxy::mqtt::commands::Dispatcher;
+                use buddy3d_proxy::mqtt::discovery::DeviceIdentity;
+                use buddy3d_proxy::mqtt::transient::TransientSignaler;
+                use buddy3d_proxy::mqtt::{state as mqtt_state, Hub, HubConfig};
+                use buddy3d_proxy::snapshot;
+                use std::sync::Arc;
+
+                let camera_id_str = factory.camera.id.to_string();
+                let identity = DeviceIdentity {
+                    camera_id: camera_id_str.clone(),
+                    camera_name: camera_name.clone(),
+                    sw_version: env!("CARGO_PKG_VERSION").to_string(),
+                    topic_prefix: cfg.mqtt_topic_prefix.clone(),
+                    discovery_prefix: cfg.mqtt_discovery_prefix.clone(),
+                };
+                let hub_cfg = HubConfig {
+                    broker_url: broker_url.clone(),
+                    username: cfg.mqtt_username.clone(),
+                    password: cfg.mqtt_password.clone(),
+                    client_id: cfg.mqtt_client_id.clone().unwrap_or_else(|| {
+                        format!("buddy3d-proxy-{camera_id_str}")
+                    }),
+                    identity: identity.clone(),
+                };
+                let (hub, eventloop) = Hub::connect(hub_cfg).context("mqtt connect")?;
+                let hub = Arc::new(hub);
+
+                let transient = Arc::new(TransientSignaler {
+                    orch: orch.clone(),
+                    prusa: prusa.clone(),
+                    endpoints: endpoints.clone(),
+                    camera: factory.camera.clone(),
+                });
+                let dispatcher = Arc::new(Dispatcher {
+                    live_outbound: factory.live_outbound.clone(),
+                    transient,
+                    camera_token: factory.camera.token.clone(),
+                });
+
+                // Hub event loop.
+                {
+                    let hub = hub.clone();
+                    let dispatcher = dispatcher.clone();
+                    tokio::spawn(async move {
+                        hub.run_event_loop(eventloop, dispatcher).await;
+                    });
+                }
+
+                // State watcher.
+                {
+                    let hub = hub.clone();
+                    let supervisor = supervisor.clone();
+                    let failed_rx = orch.failed_watch();
+                    tokio::spawn(async move {
+                        mqtt_state::run_watcher(supervisor, Some(failed_rx), move |s| {
+                            let hub = hub.clone();
+                            let s = s.to_string();
+                            tokio::spawn(async move {
+                                if let Err(e) = hub.publish_state(&s).await {
+                                    tracing::warn!(error = %e, state = %s, "publish state failed");
+                                }
+                            });
+                        }).await;
+                    });
+                }
+
+                // Snapshot orchestrator. SPS/PPS are populated on each session
+                // connect from the supervisor's cached H264Params.
+                {
+                    let hub = hub.clone();
+                    let supervisor = supervisor.clone();
+                    let interval = cfg.snapshot_interval;
+                    let sps_pps = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+                    let sps_pps_for_refresh = sps_pps.clone();
+                    let supervisor_for_refresh = supervisor.clone();
+                    tokio::spawn(async move {
+                        let mut rx = supervisor_for_refresh.state_changes();
+                        loop {
+                            if rx.changed().await.is_err() { return; }
+                            if let Some(h) = supervisor_for_refresh.cached_h264_params().await {
+                                if let Some(pair) = snapshot::extract_sps_pps(&h) {
+                                    *sps_pps_for_refresh.lock().await = Some(pair);
+                                }
+                            }
+                        }
+                    });
+                    tokio::spawn(async move {
+                        snapshot::run(supervisor, interval, sps_pps, move |jpeg| {
+                            let hub = hub.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = hub.publish_snapshot(jpeg).await {
+                                    tracing::warn!(error = %e, "publish snapshot failed");
+                                }
+                            });
+                        }).await;
+                    });
+                }
+
+                tracing::info!(broker = %broker_url, "mqtt subsystem started");
             }
 
             let _handle = Server::start(&cfg.rtsp_bind_addr, cfg.rtsp_port, supervisor.clone())

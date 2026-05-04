@@ -67,6 +67,10 @@ struct SupervisorInner {
     pub wss_reconnects_total: std::sync::atomic::AtomicU64,
     pub last_error_at: Mutex<Option<std::time::Instant>>,
     pub session_started_at: Mutex<Option<std::time::Instant>>,
+    /// When `Some`, the watchdog observes this watch and exits cleanly once
+    /// it flips to `true` — used by the auth orchestrator to signal that
+    /// further reconnect attempts will keep failing with `LoginRejected`.
+    failed_rx: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 struct SessionState {
@@ -86,6 +90,7 @@ impl Supervisor {
         camera_name: String,
         rtsp_path: String,
         idle_timeout: Duration,
+        failed_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Arc<Self> {
         let (viewer_tx, viewer_rx) = mpsc::channel(32);
         let inner = Arc::new(SupervisorInner {
@@ -104,6 +109,7 @@ impl Supervisor {
             wss_reconnects_total: std::sync::atomic::AtomicU64::new(0),
             last_error_at: Mutex::new(None),
             session_started_at: Mutex::new(None),
+            failed_rx,
         });
 
         // Spawn the viewer-event loop (handles idle timer + tear-down).
@@ -257,6 +263,16 @@ async fn reconnect_watchdog(
                 return;
             }
 
+            // If auth has latched into the failed state, further connect()
+            // attempts will burn rate-limit permits returning LoginRejected
+            // forever. Bail out — /healthz already reflects the failure.
+            if let Some(rx) = inner.failed_rx.as_ref() {
+                if *rx.borrow() {
+                    tracing::info!("auth failed; watchdog exiting");
+                    return;
+                }
+            }
+
             match inner.factory.connect(broadcast_tx.clone()).await {
                 Ok((_h264, stop, new_ended)) => {
                     let mut state = inner.state.lock().await;
@@ -373,6 +389,7 @@ mod tests {
             "Cam".into(),
             "cam".into(),
             Duration::from_secs(60),
+            None,
         );
         let _sub = sup.subscribe().await.unwrap();
         assert_eq!(connects.load(Ordering::SeqCst), 1);
@@ -389,6 +406,7 @@ mod tests {
             "Cam".into(),
             "cam".into(),
             Duration::from_secs(60),
+            None,
         );
         let _sub1 = sup.subscribe().await.unwrap();
         let _sub2 = sup.subscribe().await.unwrap();
@@ -406,6 +424,7 @@ mod tests {
             "Cam".into(),
             "cam".into(),
             Duration::from_secs(5),
+            None,
         );
         let sub = sup.subscribe().await.unwrap();
         drop(sub);
@@ -461,7 +480,7 @@ mod tests {
             connects: connects.clone(),
             fire_after: fire.clone(),
         });
-        let sup = Supervisor::new(factory, "Cam".into(), "cam".into(), Duration::from_secs(60));
+        let sup = Supervisor::new(factory, "Cam".into(), "cam".into(), Duration::from_secs(60), None);
         let _sub = sup.subscribe().await.unwrap();
         // Let the watchdog task be polled and reach `ended.await`.
         tokio::task::yield_now().await;
@@ -489,6 +508,7 @@ mod tests {
             "Cam".into(),
             "cam".into(),
             Duration::from_secs(60),
+            None,
         );
         let sub = sup.subscribe().await.unwrap();
         drop(sub);

@@ -260,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
                 camera_name.clone(),
                 rtsp_path.clone(),
                 cfg.idle_timeout,
+                Some(orch.failed_watch()),
             );
 
             // Spawn /healthz on 0.0.0.0:health_port, fed by the auth orchestrator's

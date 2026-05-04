@@ -385,11 +385,7 @@ async fn main() -> anyhow::Result<()> {
                 // Camera-status watcher: publishes mode + quality from the
                 // `Status` event the camera emits on every signaling session
                 // connect. The state values come from
-                // `Status.capabilities.stream_config.{mode,quality}`. Note
-                // that the WebRtcFactory's auto-FHD post-connect path resets
-                // quality to FHD shortly after the Status event lands, so
-                // briefly published value (e.g. HD) gets overwritten by the
-                // camera's next Status — the eventual published value is FHD.
+                // `Status.capabilities.stream_config.{mode,quality}`.
                 {
                     let hub = hub.clone();
                     let mut rx = camera_status.subscribe();

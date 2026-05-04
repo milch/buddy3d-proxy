@@ -7,18 +7,13 @@
 use crate::prusa::api::{fetch_webrtc_config, Camera};
 use crate::prusa::auth::AuthOrchestrator;
 use crate::prusa::client::PrusaClient;
-use crate::prusa::commands::encode_set_quality;
-use crate::prusa::signaling::client::Outbound;
 use crate::prusa::signaling::PrusaSignaling;
 use crate::rtsp::sdp::{extract_h264_params, H264Params};
 use crate::rtsp::server::SourceError;
 use crate::supervisor::{StopHandle, StreamFactory};
 use crate::webrtc_session::{run_session, WebRtcSession};
-use bytes::Bytes;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::rtp::packet::Packet as RtpPacket;
 
 pub struct WebRtcFactory {
@@ -80,20 +75,12 @@ impl StreamFactory for WebRtcFactory {
         let driver_session = session.clone();
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
 
-        // Clone the signaling outbound channel BEFORE moving signaling into
-        // the driver task. We use it later to push the auto-FHD configuration
-        // once WebRTC is fully up.
-        let outbound_for_post_connect = signaling.outbound.clone();
-
         // Stash the live outbound for the MQTT command dispatcher. Cleared
         // on session tear-down via Joiner::drop.
         {
             let mut guard = self.live_outbound.lock().await;
             *guard = Some(signaling.outbound.clone());
         }
-
-        let camera_token_for_post_connect = self.camera.token.clone();
-        let pc_for_post_connect = pc.clone();
 
         let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -107,43 +94,6 @@ impl StreamFactory for WebRtcFactory {
                 _ = &mut kill_rx => {
                     let _ = driver_session.close().await;
                 }
-            }
-        });
-
-        // Once the peer connection reaches Connected, send the camera-side
-        // commands that restore full 1080p quality. After many WebRTC
-        // reconnects the camera silently degrades to 640x480@10fps until
-        // told otherwise.
-        tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-            loop {
-                if pc_for_post_connect.connection_state()
-                    == RTCPeerConnectionState::Connected
-                {
-                    break;
-                }
-                if tokio::time::Instant::now() > deadline {
-                    tracing::warn!(
-                        "skipping auto set-quality FHD: peer never reached Connected"
-                    );
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            // Small grace period so the camera has finished setting up.
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            let payload = encode_set_quality(3, &camera_token_for_post_connect);
-            if outbound_for_post_connect
-                .send(Outbound::BinaryEvent {
-                    name: "configuration".into(),
-                    payload: Bytes::from(payload),
-                    expect_ack: false,
-                })
-                .await
-                .is_ok()
-            {
-                tracing::info!("auto-applied set-quality=FHD after WebRTC connect");
             }
         });
 

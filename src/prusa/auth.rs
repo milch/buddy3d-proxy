@@ -185,6 +185,8 @@ pub struct AuthOrchestrator {
     email: String,
     password: String,
     state: Mutex<Option<StoredTokens>>,
+    failed_tx: tokio::sync::watch::Sender<bool>,
+    failed_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl AuthOrchestrator {
@@ -195,6 +197,7 @@ impl AuthOrchestrator {
         email: String,
         password: String,
     ) -> Self {
+        let (failed_tx, failed_rx) = tokio::sync::watch::channel(false);
         Self {
             client,
             endpoints,
@@ -202,6 +205,28 @@ impl AuthOrchestrator {
             email,
             password,
             state: Mutex::new(None),
+            failed_tx,
+            failed_rx,
+        }
+    }
+
+    /// Returns a watch receiver that flips to `true` once the orchestrator has
+    /// concluded credentials are permanently bad. The /healthz server reads this.
+    pub fn failed_watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.failed_rx.clone()
+    }
+
+    async fn bootstrap_and_latch(&self) -> Result<StoredTokens, AuthError> {
+        match bootstrap(&self.client, &self.endpoints, &self.email, &self.password).await {
+            Ok(t) => Ok(t),
+            Err(e @ AuthError::LoginRejected { .. }) => {
+                // Permanent failure: wrong creds, account locked, etc. The /healthz
+                // server reads this latch via failed_watch() and returns 503 so an
+                // orchestrator/operator can replace the process with new creds.
+                let _ = self.failed_tx.send(true);
+                Err(e)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -226,14 +251,11 @@ impl AuthOrchestrator {
                     Ok(new) => new,
                     Err(AuthError::Http(ClientError::Client { .. })) => {
                         tracing::warn!("refresh token rejected; falling back to bootstrap");
-                        bootstrap(&self.client, &self.endpoints, &self.email, &self.password)
-                            .await?
+                        self.bootstrap_and_latch().await?
                     }
                     Err(e) => return Err(e),
                 },
-                None => {
-                    bootstrap(&self.client, &self.endpoints, &self.email, &self.password).await?
-                }
+                None => self.bootstrap_and_latch().await?,
             };
             self.store
                 .save(&new_tokens)
@@ -525,5 +547,52 @@ mod tests {
         let _t = orch.access_token().await.unwrap();
         let cached = orch.state.lock().await.as_ref().unwrap().access_expires_at;
         assert_eq!(cached, new_exp);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_latches_failed_on_login_rejected() {
+        let server = MockServer::start().await;
+        // Mirror bootstrap_returns_login_rejected_when_form_post_returns_200's mock
+        // setup: GET /login/ returns the form with a CSRF token, POST /login/
+        // returns 200 (the rejection signal — no Location, no code).
+        Mock::given(method("GET"))
+            .and(path("/login/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<input name="csrfmiddlewaretoken" value="x">"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/login/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("login form re-rendered with errors"),
+            )
+            .mount(&server)
+            .await;
+
+        let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
+        let prusa = PrusaClient::new(reqwest::Client::new(), limiter);
+        let endpoints = AuthEndpoints {
+            account_base: server.uri().parse().unwrap(),
+            connect_base: server.uri().parse().unwrap(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json"));
+        let orch = Arc::new(AuthOrchestrator::new(
+            prusa,
+            endpoints,
+            store,
+            "user@example.com".into(),
+            "wrong".into(),
+        ));
+        let mut watch = orch.failed_watch();
+        assert_eq!(*watch.borrow_and_update(), false);
+        let result = orch.access_token().await;
+        assert!(
+            result.is_err(),
+            "expected access_token to fail; got {result:?}"
+        );
+        // Latch is set synchronously inside bootstrap_and_latch on LoginRejected.
+        assert_eq!(*watch.borrow_and_update(), true);
     }
 }

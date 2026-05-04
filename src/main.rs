@@ -67,17 +67,32 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         quality: u32,
     },
+    /// Probe the local /healthz endpoint. Exits 0 on HTTP 2xx, non-zero
+    /// otherwise. Intended for container healthchecks (no auth required).
+    Health {
+        /// Port the running `serve` process exposes /healthz on.
+        #[arg(long, env = "HEALTH_PORT", default_value_t = 8080)]
+        port: u16,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // The healthcheck runs inside the container alongside `serve` and must
+    // not require Prusa credentials, tracing setup, or the rustls provider
+    // — handle it before any of that.
+    if let Cmd::Health { port } = cli.command {
+        return run_health(port).await;
+    }
+
     // rustls 0.23 (pulled in by webrtc 0.17 + reqwest 0.13) requires an
     // explicit process-level CryptoProvider before any TLS handshake. Install
     // aws-lc-rs once at startup; ignore the result if it's already installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     init_tracing();
-    let cli = Cli::parse();
     let cfg = Config::from_env().context("load config from environment")?;
 
     let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
@@ -250,11 +265,14 @@ async fn main() -> anyhow::Result<()> {
                 "selected camera"
             );
 
+            let live_outbound = buddy3d_proxy::live_outbound::empty();
             let factory = Arc::new(WebRtcFactory {
                 orch: orch.clone(),
                 prusa: prusa.clone(),
                 camera,
+                live_outbound: live_outbound.clone(),
             });
+            let _live_outbound = live_outbound;
             let supervisor = Supervisor::new(
                 factory,
                 camera_name.clone(),
@@ -312,51 +330,26 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("ctrl+c received; shutting down");
         }
         Cmd::RestartCamera { field } => {
-            let token = orch.access_token().await.context("acquire access token")?;
-            let printers = list_printers(&prusa, &endpoints.connect_base, &token)
+            let camera = buddy3d_proxy::mqtt::transient::lookup_camera(&orch, &prusa, &endpoints)
                 .await
-                .context("list printers")?;
-            let printer = printers
-                .first()
-                .context("no printers visible to this account")?;
-            let cams = list_cameras(&prusa, &endpoints.connect_base, &token, &printer.uuid)
-                .await
-                .with_context(|| format!("list cameras for printer {}", printer.uuid))?;
-            let camera = cams
-                .first()
-                .context("no cameras visible on this printer")?
-                .clone();
+                .context("lookup camera")?;
             tracing::info!(
                 camera.id = camera.id,
                 camera.name = camera.name.as_deref().unwrap_or("(unnamed)"),
                 field,
                 "sending restart trigger to camera"
             );
-
-            let webrtc_cfg =
-                buddy3d_proxy::prusa::api::fetch_webrtc_config(&prusa, &token)
-                    .await
-                    .context("fetch webrtc config")?;
-            let signaling = PrusaSignaling::connect(
-                camera.token.clone(),
-                token.clone(),
-                webrtc_cfg.clone(),
-            )
-            .await
-            .context("connect signaling")?;
-
-            // Hand-encode a CameraTrigger: { camera_token: <token>, [field]: 1 }
-            // Field 11 (token) is known from observed wire frames. The action
-            // field number is what we're probing.
+            let signaler = buddy3d_proxy::mqtt::transient::TransientSignaler {
+                orch: orch.clone(),
+                prusa: prusa.clone(),
+                endpoints: endpoints.clone(),
+                camera: camera.clone(),
+            };
             let payload = encode_camera_trigger(field, &camera.token);
-            tracing::info!(payload_len = payload.len(), "sending trigger");
-            signaling
-                .send_trigger(payload)
+            signaler
+                .send("trigger", payload)
                 .await
-                .context("send trigger")?;
-
-            // Give the server a moment to deliver and the camera a moment to act.
-            tokio::time::sleep(Duration::from_secs(2)).await;
+                .context("send restart trigger")?;
             tracing::info!("restart trigger sent; camera should reboot in a few seconds");
         }
         Cmd::SetMode { mode } => {
@@ -364,114 +357,64 @@ async fn main() -> anyhow::Result<()> {
                 (1..=3).contains(&mode),
                 "mode must be 1 (Auto), 2 (Day), or 3 (Night)"
             );
-            let label = match mode {
-                1 => "Auto",
-                2 => "Day",
-                3 => "Night",
-                _ => "?",
+            let camera = buddy3d_proxy::mqtt::transient::lookup_camera(&orch, &prusa, &endpoints)
+                .await
+                .context("lookup camera")?;
+            let signaler = buddy3d_proxy::mqtt::transient::TransientSignaler {
+                orch: orch.clone(),
+                prusa: prusa.clone(),
+                endpoints: endpoints.clone(),
+                camera: camera.clone(),
             };
-            send_camera_configuration(
-                &orch,
-                &prusa,
-                &endpoints,
-                "setting camera IR mode",
-                ("mode", mode, label),
-                |token| encode_set_mode(mode, token),
-            )
-            .await?;
+            let payload = encode_set_mode(mode, &camera.token);
+            signaler
+                .send("configuration", payload)
+                .await
+                .context("send set_mode")?;
         }
         Cmd::SetQuality { quality } => {
             anyhow::ensure!(
                 (1..=3).contains(&quality),
                 "quality must be 1 (SD), 2 (HD), or 3 (FHD)"
             );
-            let label = match quality {
-                1 => "SD",
-                2 => "HD",
-                3 => "FHD",
-                _ => "?",
+            let camera = buddy3d_proxy::mqtt::transient::lookup_camera(&orch, &prusa, &endpoints)
+                .await
+                .context("lookup camera")?;
+            let signaler = buddy3d_proxy::mqtt::transient::TransientSignaler {
+                orch: orch.clone(),
+                prusa: prusa.clone(),
+                endpoints: endpoints.clone(),
+                camera: camera.clone(),
             };
-            send_camera_configuration(
-                &orch,
-                &prusa,
-                &endpoints,
-                "setting camera video resolution",
-                ("quality", quality, label),
-                |token| encode_set_quality(quality, token),
-            )
-            .await?;
+            let payload = encode_set_quality(quality, &camera.token);
+            signaler
+                .send("configuration", payload)
+                .await
+                .context("send set_quality")?;
         }
+        Cmd::Health { .. } => unreachable!("handled before Config setup"),
     }
     Ok(())
 }
 
-/// Common boilerplate for any setting-mutation: discover the camera, connect
-/// via PrusaSignaling, wait for WebRTC to settle (so the server treats us
-/// as an authorized viewer), send a trigger-field-3 ("subscribe to settings"),
-/// then send the caller's pre-encoded Configuration payload.
-async fn send_camera_configuration<F>(
-    orch: &Arc<AuthOrchestrator>,
-    prusa: &PrusaClient,
-    endpoints: &AuthEndpoints,
-    log_msg: &str,
-    (key, value, label): (&'static str, u32, &str),
-    payload_for: F,
-) -> anyhow::Result<()>
-where
-    F: FnOnce(&str) -> Vec<u8>,
-{
-    let token = orch.access_token().await.context("acquire access token")?;
-    let printers = list_printers(prusa, &endpoints.connect_base, &token)
+async fn run_health(port: u16) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{port}/healthz");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("build reqwest client")?;
+    let resp = client
+        .get(&url)
+        .send()
         .await
-        .context("list printers")?;
-    let printer = printers
-        .first()
-        .context("no printers visible to this account")?;
-    let cams = list_cameras(prusa, &endpoints.connect_base, &token, &printer.uuid)
-        .await
-        .with_context(|| format!("list cameras for printer {}", printer.uuid))?;
-    let camera = cams
-        .first()
-        .context("no cameras visible on this printer")?
-        .clone();
-    tracing::info!(
-        camera.id = camera.id,
-        "{key}" = value,
-        "{key}.label" = label,
-        "{log_msg}"
-    );
-
-    let webrtc_cfg = buddy3d_proxy::prusa::api::fetch_webrtc_config(prusa, &token)
-        .await
-        .context("fetch webrtc config")?;
-    let signaling =
-        PrusaSignaling::connect(camera.token.clone(), token.clone(), webrtc_cfg.clone())
-            .await
-            .context("connect signaling")?;
-
-    // Configuration changes require an active "viewer" session. The browser
-    // sends a trigger field 3 (likely "subscribe to settings") after the
-    // WebRTC handshake completes, before emitting any configuration event.
-    // Without this the server returns "Client does not have permission".
-    tokio::time::sleep(Duration::from_secs(6)).await;
-    let trigger3 = encode_camera_trigger(3, &camera.token);
-    signaling
-        .send_trigger(trigger3)
-        .await
-        .context("send field-3 trigger")?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let payload = payload_for(&camera.token);
-    signaling
-        .send_configuration(payload)
-        .await
-        .context("send configuration")?;
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    tracing::info!("configuration sent; new {key} should apply on next stream");
-    Ok(())
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("healthz returned {status}");
+    }
 }
-
 
 /// Lowercase, replace whitespace + non-alphanumerics with `-`, collapse runs.
 fn slugify(name: &str) -> String {

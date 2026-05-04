@@ -25,6 +25,10 @@ pub struct WebRtcFactory {
     pub orch: Arc<AuthOrchestrator>,
     pub prusa: PrusaClient,
     pub camera: Camera,
+    /// Shared registry that the MQTT command dispatcher reads to send commands
+    /// over the live signaling channel without bringing up a transient connection.
+    /// Populated on every successful connect; cleared on session tear-down.
+    pub live_outbound: crate::live_outbound::LiveOutbound,
 }
 
 #[async_trait::async_trait]
@@ -75,6 +79,14 @@ impl StreamFactory for WebRtcFactory {
         // the driver task. We use it later to push the auto-FHD configuration
         // once WebRTC is fully up.
         let outbound_for_post_connect = signaling.outbound.clone();
+
+        // Stash the live outbound for the MQTT command dispatcher. Cleared
+        // on session tear-down via Joiner::drop.
+        {
+            let mut guard = self.live_outbound.lock().await;
+            *guard = Some(signaling.outbound.clone());
+        }
+
         let camera_token_for_post_connect = self.camera.token.clone();
         let pc_for_post_connect = pc.clone();
 
@@ -184,6 +196,7 @@ impl StreamFactory for WebRtcFactory {
             kill: Option<oneshot::Sender<()>>,
             forwarder: tokio::task::JoinHandle<()>,
             driver: tokio::task::JoinHandle<()>,
+            live_outbound: crate::live_outbound::LiveOutbound,
         }
         impl Drop for Joiner {
             fn drop(&mut self) {
@@ -192,12 +205,21 @@ impl StreamFactory for WebRtcFactory {
                 }
                 self.forwarder.abort();
                 self.driver.abort();
+                // Clear the live outbound registry. The Drop runs synchronously
+                // on whatever thread held the StopHandle, so we hand the
+                // clear-op to a tokio task to avoid blocking on the Mutex.
+                let live = self.live_outbound.clone();
+                tokio::spawn(async move {
+                    let mut guard = live.lock().await;
+                    *guard = None;
+                });
             }
         }
         let joiner = Joiner {
             kill: Some(kill_tx),
             forwarder: forwarder_handle,
             driver: driver_handle,
+            live_outbound: self.live_outbound.clone(),
         };
 
         Ok((

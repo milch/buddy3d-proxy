@@ -141,9 +141,29 @@ impl Hub {
                     let suffix = topic.strip_prefix(&topic_prefix).unwrap_or(&topic).to_string();
                     if let Some(cmd) = commands::parse(&suffix, &p.payload) {
                         let dispatcher = dispatcher.clone();
+                        let hub = self.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = dispatcher.dispatch(cmd).await {
-                                tracing::warn!(?cmd, error = %e, "command dispatch failed");
+                            match dispatcher.dispatch(cmd).await {
+                                Ok(()) => {
+                                    // Optimistic local update: the camera doesn't echo
+                                    // its settings back, so we publish what we just sent
+                                    // so HA's select entity reflects the new value.
+                                    let echo: Result<(), HubError> = match cmd {
+                                        commands::Command::SetMode(1) => hub.publish_mode_state("Auto").await,
+                                        commands::Command::SetMode(2) => hub.publish_mode_state("Day").await,
+                                        commands::Command::SetMode(3) => hub.publish_mode_state("Night").await,
+                                        commands::Command::SetQuality(1) => hub.publish_quality_state("SD").await,
+                                        commands::Command::SetQuality(2) => hub.publish_quality_state("HD").await,
+                                        commands::Command::SetQuality(3) => hub.publish_quality_state("FHD").await,
+                                        commands::Command::SetMode(_) | commands::Command::SetQuality(_) | commands::Command::Reboot => Ok(()),
+                                    };
+                                    if let Err(e) = echo {
+                                        tracing::warn!(?cmd, error = %e, "publish state echo failed");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(?cmd, error = %e, "command dispatch failed");
+                                }
                             }
                         });
                     } else {

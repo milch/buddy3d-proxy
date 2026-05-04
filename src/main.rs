@@ -380,6 +380,27 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
 
+                // Auto-FHD echo: the WebRtcFactory sets quality=FHD on every
+                // session connect. Publish that to MQTT so HA's quality select
+                // doesn't show "unknown" until the user touches it.
+                {
+                    let hub = hub.clone();
+                    let supervisor = supervisor.clone();
+                    tokio::spawn(async move {
+                        let mut rx = supervisor.state_changes();
+                        loop {
+                            if rx.changed().await.is_err() {
+                                return;
+                            }
+                            if matches!(*rx.borrow(), buddy3d_proxy::supervisor::State::Streaming) {
+                                if let Err(e) = hub.publish_quality_state("FHD").await {
+                                    tracing::warn!(error = %e, "publish quality=FHD failed");
+                                }
+                            }
+                        }
+                    });
+                }
+
                 // Snapshot orchestrator. SPS/PPS are populated on each session
                 // connect from the supervisor's cached H264Params.
                 {

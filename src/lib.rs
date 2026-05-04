@@ -7,6 +7,7 @@ pub mod pkce;
 pub mod prusa;
 pub mod proto;
 pub mod rate_limit;
+pub mod snapshot;
 pub mod rtsp;
 pub mod supervisor;
 pub mod token_store;

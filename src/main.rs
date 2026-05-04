@@ -398,6 +398,21 @@ async fn main() -> anyhow::Result<()> {
                             let snapshot = rx.borrow().clone();
                             let Some(status) = snapshot else { continue };
                             let Some(caps) = status.capabilities else { continue };
+                            // Update the device's sw_version with the
+                            // camera's actual firmware before extracting
+                            // stream config, so HA's device card reflects
+                            // "{fw} (proxy {pkg})" instead of just our
+                            // proxy version.
+                            if !caps.fw_version.is_empty() {
+                                let sw_version = format!(
+                                    "{} (proxy {})",
+                                    caps.fw_version,
+                                    env!("CARGO_PKG_VERSION")
+                                );
+                                if let Err(e) = hub.republish_with_sw_version(&sw_version).await {
+                                    tracing::warn!(error = %e, "republish discovery with fw_version failed");
+                                }
+                            }
                             let Some(cfg) = caps.stream_config else { continue };
                             let mode = match cfg.mode {
                                 1 => Some("Auto"),

@@ -87,6 +87,24 @@ impl Hub {
         Ok(())
     }
 
+    /// Re-publish all five HA discovery payloads with an overridden
+    /// `sw_version`. HA treats discovery messages with the same `unique_id`
+    /// as updates, so this swaps the version label in place without
+    /// re-creating the entities. Called when we learn the camera's actual
+    /// firmware version from a `Status` event.
+    pub async fn republish_with_sw_version(&self, sw_version: &str) -> Result<(), HubError> {
+        let mut id = self.identity.clone();
+        id.sw_version = sw_version.to_string();
+        for msg in discovery::all(&id) {
+            let payload = serde_json::to_vec(&msg.payload).map_err(HubError::Json)?;
+            self.client
+                .publish(msg.topic, QoS::AtLeastOnce, true, payload)
+                .await
+                .map_err(HubError::Mqtt)?;
+        }
+        Ok(())
+    }
+
     pub async fn publish_state(&self, state: &str) -> Result<(), HubError> {
         let topic = format!("{}/{}/state", self.identity.topic_prefix, self.identity.camera_id);
         self.client

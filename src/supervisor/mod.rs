@@ -65,8 +65,6 @@ struct SupervisorInner {
     /// Channel the RTSP server's Subscription Drop sends to.
     viewer_tx: mpsc::Sender<ViewerEvent>,
     pub wss_reconnects_total: std::sync::atomic::AtomicU64,
-    // Read by Task 7's metrics::run via Supervisor::snapshot.
-    #[allow(dead_code)]
     pub webrtc_renegotiations_total: std::sync::atomic::AtomicU64,
     pub last_error_at: Mutex<Option<std::time::Instant>>,
     pub session_started_at: Mutex<Option<std::time::Instant>>,
@@ -116,6 +114,32 @@ impl Supervisor {
 
         Arc::new(Self { inner })
     }
+
+    /// Cheap, lock-free read of operational counters for the metrics emitter.
+    /// Locks the small `last_error_at` / `session_started_at` mutexes briefly.
+    pub async fn snapshot(&self) -> SupervisorSnapshot {
+        let state = self.inner.state.lock().await;
+        let session_started_at = *self.inner.session_started_at.lock().await;
+        let last_error_at = *self.inner.last_error_at.lock().await;
+        SupervisorSnapshot {
+            state: state.state,
+            viewers: self.inner.viewer_count.load(Ordering::SeqCst).max(0) as u32,
+            wss_reconnects_total: self.inner.wss_reconnects_total.load(Ordering::SeqCst),
+            webrtc_renegotiations_total: self.inner.webrtc_renegotiations_total.load(Ordering::SeqCst),
+            session_uptime_secs: session_started_at.map(|t| t.elapsed().as_secs()),
+            last_error_age_secs: last_error_at.map(|t| t.elapsed().as_secs()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SupervisorSnapshot {
+    pub state: State,
+    pub viewers: u32,
+    pub wss_reconnects_total: u64,
+    pub webrtc_renegotiations_total: u64,
+    pub session_uptime_secs: Option<u64>,
+    pub last_error_age_secs: Option<u64>,
 }
 
 #[async_trait::async_trait]

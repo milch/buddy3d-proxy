@@ -1,5 +1,6 @@
 pub mod backoff;
 pub mod config;
+pub mod health;
 pub mod jwt;
 pub mod pkce;
 pub mod prusa;

@@ -51,11 +51,41 @@ impl Config {
                 None => Ok(default),
             }
         }
-        fn parse_url(k: &'static str) -> Result<Option<url::Url>, ConfigError> {
-            match std::env::var(k).ok().filter(|s| !s.is_empty()) {
-                Some(v) => Ok(Some(v.parse().map_err(|e: url::ParseError| ConfigError::Invalid(k, e.to_string()))?)),
-                None => Ok(None),
+        fn parse_mqtt_url(k: &'static str) -> Result<Option<url::Url>, ConfigError> {
+            let raw = match std::env::var(k).ok().filter(|s| !s.is_empty()) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            let url: url::Url = raw.parse().map_err(|_| {
+                ConfigError::Invalid(
+                    k,
+                    format!(
+                        "must start with mqtt:// or mqtts:// (got {raw:?}); \
+                         example: mqtt://broker.local:1883"
+                    ),
+                )
+            })?;
+            match url.scheme() {
+                "mqtt" | "mqtts" => {}
+                other => {
+                    return Err(ConfigError::Invalid(
+                        k,
+                        format!(
+                            "scheme must be mqtt or mqtts (got {other:?}); \
+                             example: mqtt://broker.local:1883"
+                        ),
+                    ));
+                }
             }
+            if url.host_str().is_none() {
+                return Err(ConfigError::Invalid(
+                    k,
+                    format!(
+                        "missing host (got {raw:?}); example: mqtt://broker.local:1883"
+                    ),
+                ));
+            }
+            Ok(Some(url))
         }
         Ok(Self {
             prusa_email: req("PRUSA_EMAIL")?,
@@ -69,7 +99,7 @@ impl Config {
             token_store_path: opt("TOKEN_STORE_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/data/tokens.json")),
             health_port: parse_u16("HEALTH_PORT", 8080)?,
             metrics_interval: Duration::from_secs(parse_u64("METRICS_INTERVAL_SECONDS", 60)?),
-            mqtt_broker_url: parse_url("MQTT_BROKER_URL")?,
+            mqtt_broker_url: parse_mqtt_url("MQTT_BROKER_URL")?,
             mqtt_username: opt("MQTT_USERNAME"),
             mqtt_password: opt("MQTT_PASSWORD"),
             mqtt_client_id: opt("MQTT_CLIENT_ID"),
@@ -203,6 +233,45 @@ mod tests {
                     Config::from_env(),
                     Err(ConfigError::Invalid("MQTT_BROKER_URL", _))
                 ));
+            },
+        );
+    }
+
+    /// Bare hostname (no scheme). url::Url accepts `host.lan:1883` as
+    /// scheme=`host.lan` path=`1883`, which would later silently fail at
+    /// connect time. We reject it at config load with a hint.
+    #[test]
+    fn rejects_mqtt_broker_url_without_scheme() {
+        with_env(
+            &[
+                ("PRUSA_EMAIL", "u@e.com"),
+                ("PRUSA_PASSWORD", "p"),
+                ("MQTT_BROKER_URL", "homeassistant.lan:1883"),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("scheme must be mqtt or mqtts")
+                        || msg.contains("missing host"),
+                    "expected scheme/host hint, got: {msg}"
+                );
+                assert!(msg.contains("mqtt://"), "error should suggest mqtt:// prefix");
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_mqtt_broker_url_with_http_scheme() {
+        with_env(
+            &[
+                ("PRUSA_EMAIL", "u@e.com"),
+                ("PRUSA_PASSWORD", "p"),
+                ("MQTT_BROKER_URL", "http://broker.local:1883"),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(err.to_string().contains("scheme must be mqtt or mqtts"));
             },
         );
     }

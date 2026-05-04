@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ── Stage 1: base image with cargo-chef + native toolchain for aws-lc-sys ───
-FROM rust:1-bookworm AS chef
+FROM rust:1.88-bookworm AS chef
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -26,6 +26,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data
+RUN groupadd -r app && useradd -r -g app -u 10001 -d /data -s /usr/sbin/nologin app \
+    && chown -R app:app /data
+USER app
 COPY --from=builder /build/target/release/buddy3d-proxy /usr/local/bin/buddy3d-proxy
 EXPOSE 8554 8080
 VOLUME ["/data"]

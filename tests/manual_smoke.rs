@@ -136,17 +136,16 @@ async fn real_prusa_stream_smoke() {
     let (signal_tx, signal_rx) = mpsc::channel(32);
     let (rtp_tx, mut rtp_rx) = mpsc::channel(1024);
     let sid = signaling.session_id.clone();
-    let session = Arc::new(
-        WebRtcSession::new(
-            &webrtc_cfg,
-            camera.token.clone(),
-            sid,
-            signal_tx.clone(),
-            rtp_tx,
-        )
-        .await
-        .expect("session"),
-    );
+    let (session, _pc_terminated_rx) = WebRtcSession::new(
+        &webrtc_cfg,
+        camera.token.clone(),
+        sid,
+        signal_tx.clone(),
+        rtp_tx,
+    )
+    .await
+    .expect("session");
+    let session = Arc::new(session);
 
     let driver_session = session.clone();
     let driver = tokio::spawn(async move {

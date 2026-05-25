@@ -175,17 +175,16 @@ async fn main() -> anyhow::Result<()> {
             let (signal_tx, signal_rx) = mpsc::channel(32);
             let (rtp_tx, mut rtp_rx) = mpsc::channel(1024);
             let session_id = signaling.session_id.clone();
-            let session = Arc::new(
-                WebRtcSession::new(
-                    &webrtc_cfg,
-                    camera.token.clone(),
-                    session_id,
-                    signal_tx.clone(),
-                    rtp_tx,
-                )
-                .await
-                .context("build webrtc session")?,
-            );
+            let (session, _pc_terminated_rx) = WebRtcSession::new(
+                &webrtc_cfg,
+                camera.token.clone(),
+                session_id,
+                signal_tx.clone(),
+                rtp_tx,
+            )
+            .await
+            .context("build webrtc session")?;
+            let session = Arc::new(session);
 
             // RTP packet counter: logs every 5 seconds.
             let counter = tokio::spawn(async move {

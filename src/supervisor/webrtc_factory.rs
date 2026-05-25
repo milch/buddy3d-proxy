@@ -59,17 +59,16 @@ impl StreamFactory for WebRtcFactory {
         let (signal_tx, signal_rx) = mpsc::channel(32);
         let (rtp_internal_tx, mut rtp_internal_rx) = mpsc::channel::<RtpPacket>(1024);
 
-        let session = Arc::new(
-            WebRtcSession::new(
-                &webrtc_cfg,
-                self.camera.token.clone(),
-                sid,
-                signal_tx.clone(),
-                rtp_internal_tx,
-            )
-            .await
-            .map_err(|e| SourceError::Unavailable(format!("session: {e}")))?,
-        );
+        let (session, mut pc_terminated_rx) = WebRtcSession::new(
+            &webrtc_cfg,
+            self.camera.token.clone(),
+            sid,
+            signal_tx.clone(),
+            rtp_internal_tx,
+        )
+        .await
+        .map_err(|e| SourceError::Unavailable(format!("session: {e}")))?;
+        let session = Arc::new(session);
 
         let pc = session.peer_connection();
         let driver_session = session.clone();
@@ -84,11 +83,18 @@ impl StreamFactory for WebRtcFactory {
 
         let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // Spawn the run_session driver. Stop when kill_rx fires or the
-        // signaling channel closes.
+        // Spawn the run_session driver. Stop when kill_rx fires, the
+        // signaling channel closes, or the peer connection reaches a
+        // terminal state (ICE failure that did NOT close signaling — without
+        // this arm the supervisor stays at Streaming indefinitely after a
+        // mid-stream ICE drop).
         let driver_handle = tokio::spawn(async move {
             tokio::select! {
                 _ = run_session(signaling, &driver_session, signal_tx, signal_rx) => {
+                    let _ = ended_tx.send(());
+                }
+                _ = &mut pc_terminated_rx => {
+                    let _ = driver_session.close().await;
                     let _ = ended_tx.send(());
                 }
                 _ = &mut kill_rx => {

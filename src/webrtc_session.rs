@@ -49,13 +49,17 @@ impl WebRtcSession {
     /// Build the PeerConnection with ICE servers from the Prusa config.
     /// `outbound_signal_tx` receives SDP/ICE messages we want to send back to Prusa.
     /// `rtp_tx` receives every inbound RTP packet on the negotiated video track.
+    /// Builds the session and returns it alongside a one-shot receiver that
+    /// fires when the peer connection reaches a terminal state (`Failed` or
+    /// `Closed`). The supervisor's reconnect watchdog uses this signal to
+    /// detect ICE failures that don't tear down the signaling websocket.
     pub async fn new(
         cfg: &WebRtcConfig,
         camera_token: String,
         session_id: String,
         outbound_signal_tx: mpsc::Sender<proto::WebRtcSignal>,
         rtp_tx: mpsc::Sender<RtpPacket>,
-    ) -> Result<Self, SessionError> {
+    ) -> Result<(Self, tokio::sync::oneshot::Receiver<()>), SessionError> {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
 
@@ -159,43 +163,63 @@ impl WebRtcSession {
             })
         }));
 
-        // When the peer connection reaches Connected, log the selected ICE
-        // candidate pair so we can tell whether the media is going LAN-direct
-        // (host), via STUN-discovered public IPs (srflx), or relayed through
-        // a TURN server (relay). For Prusa Connect over the internet, we
-        // expect srflx in the common case and relay when symmetric NAT/CGNAT
-        // forces it. host means we're on the same LAN as the camera.
+        // Peer-connection state hook. Two jobs:
+        //   1. On Connected, log the selected ICE candidate pair so we can
+        //      tell whether the media is going LAN-direct (host), via
+        //      STUN-discovered public IPs (srflx), or relayed through a TURN
+        //      server (relay). For Prusa Connect over the internet we expect
+        //      srflx in the common case and relay when symmetric NAT/CGNAT
+        //      forces it. host means we're on the same LAN as the camera.
+        //   2. On Failed/Closed, fire `pc_terminated_tx` so the watchdog
+        //      reconnects. ICE failure does not close the signaling
+        //      websocket, so without this signal the supervisor sits at
+        //      Streaming forever while no media flows.
+        let (pc_terminated_tx, pc_terminated_rx) = tokio::sync::oneshot::channel::<()>();
+        let pc_terminated_tx = Arc::new(std::sync::Mutex::new(Some(pc_terminated_tx)));
         let pc_for_state = pc.clone();
+        let pc_terminated_tx_cb = pc_terminated_tx.clone();
         pc.on_peer_connection_state_change(Box::new(move |state| {
             let pc = pc_for_state.clone();
+            let pc_terminated_tx = pc_terminated_tx_cb.clone();
             Box::pin(async move {
                 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-                if state != RTCPeerConnectionState::Connected {
-                    return;
-                }
-                let pair = pc.sctp().transport().ice_transport().get_selected_candidate_pair().await;
-                if let Some(pair) = pair {
-                    let local_kind = describe_candidate_type(pair.local.typ);
-                    let remote_kind = describe_candidate_type(pair.remote.typ);
-                    let path = match (local_kind, remote_kind) {
-                        ("host", "host") => "LAN direct",
-                        ("relay", _) | (_, "relay") => "TURN relay",
-                        ("srflx", _) | (_, "srflx") => "STUN-aided direct (P2P over NAT)",
-                        ("prflx", _) | (_, "prflx") => "peer-reflexive direct",
-                        _ => "unknown",
-                    };
-                    tracing::info!(
-                        path = %path,
-                        local.kind = %local_kind,
-                        local.address = %pair.local.address,
-                        local.port = pair.local.port,
-                        remote.kind = %remote_kind,
-                        remote.address = %pair.remote.address,
-                        remote.port = pair.remote.port,
-                        "ice connected via {path}",
-                    );
-                } else {
-                    tracing::warn!("peer connected but no selected ice candidate pair");
+                match state {
+                    RTCPeerConnectionState::Connected => {
+                        let pair = pc.sctp().transport().ice_transport().get_selected_candidate_pair().await;
+                        if let Some(pair) = pair {
+                            let local_kind = describe_candidate_type(pair.local.typ);
+                            let remote_kind = describe_candidate_type(pair.remote.typ);
+                            let path = match (local_kind, remote_kind) {
+                                ("host", "host") => "LAN direct",
+                                ("relay", _) | (_, "relay") => "TURN relay",
+                                ("srflx", _) | (_, "srflx") => "STUN-aided direct (P2P over NAT)",
+                                ("prflx", _) | (_, "prflx") => "peer-reflexive direct",
+                                _ => "unknown",
+                            };
+                            tracing::info!(
+                                path = %path,
+                                local.kind = %local_kind,
+                                local.address = %pair.local.address,
+                                local.port = pair.local.port,
+                                remote.kind = %remote_kind,
+                                remote.address = %pair.remote.address,
+                                remote.port = pair.remote.port,
+                                "ice connected via {path}",
+                            );
+                        } else {
+                            tracing::warn!("peer connected but no selected ice candidate pair");
+                        }
+                    }
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                        tracing::warn!(
+                            state = ?state,
+                            "peer connection terminated; signaling session end so watchdog reconnects",
+                        );
+                        if let Some(tx) = pc_terminated_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    _ => {}
                 }
             })
         }));
@@ -228,12 +252,15 @@ impl WebRtcSession {
             })
         }));
 
-        Ok(Self {
-            pc,
-            camera_token,
-            session_id,
-            pending_ice: tokio::sync::Mutex::new(Vec::new()),
-        })
+        Ok((
+            Self {
+                pc,
+                camera_token,
+                session_id,
+                pending_ice: tokio::sync::Mutex::new(Vec::new()),
+            },
+            pc_terminated_rx,
+        ))
     }
 
     /// Returns a clone of the underlying PC for tasks that need direct access

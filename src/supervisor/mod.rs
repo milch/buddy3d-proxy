@@ -63,7 +63,7 @@ struct SupervisorInner {
     /// Set when a session is up; reset when torn down.
     state: Mutex<SessionState>,
     /// Channel the RTSP server's Subscription Drop sends to.
-    viewer_tx: mpsc::Sender<ViewerEvent>,
+    viewer_tx: mpsc::UnboundedSender<ViewerEvent>,
     pub wss_reconnects_total: std::sync::atomic::AtomicU64,
     pub last_error_at: Mutex<Option<std::time::Instant>>,
     pub session_started_at: Mutex<Option<std::time::Instant>>,
@@ -95,7 +95,7 @@ impl Supervisor {
         idle_timeout: Duration,
         failed_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Arc<Self> {
-        let (viewer_tx, viewer_rx) = mpsc::channel(32);
+        let (viewer_tx, viewer_rx) = mpsc::unbounded_channel();
         let (state_watch, _) = tokio::sync::watch::channel(State::Idle);
         let inner = Arc::new(SupervisorInner {
             factory,
@@ -170,7 +170,7 @@ impl StreamSource for Supervisor {
     async fn subscribe(&self) -> Result<Subscription, SourceError> {
         // Increment optimistically; we'll undo on failure.
         self.inner.viewer_count.fetch_add(1, Ordering::SeqCst);
-        let _ = self.inner.viewer_tx.send(ViewerEvent::Attached).await;
+        let _ = self.inner.viewer_tx.send(ViewerEvent::Attached);
 
         // Acquire (or reacquire) the session.
         {
@@ -197,7 +197,7 @@ impl StreamSource for Supervisor {
                             drop(s);
                             // Roll back the viewer count via the event loop —
                             // it owns the canonical fetch_sub.
-                            let _ = self.inner.viewer_tx.send(ViewerEvent::Detached).await;
+                            let _ = self.inner.viewer_tx.send(ViewerEvent::Detached);
                             *self.inner.last_error_at.lock().await = Some(std::time::Instant::now());
                             return Err(e);
                         }
@@ -228,18 +228,14 @@ impl StreamSource for Supervisor {
                         match current {
                             State::Streaming => break,
                             State::Idle => {
-                                let _ = self.inner.viewer_tx.send(ViewerEvent::Detached).await;
+                                let _ = self.inner.viewer_tx.send(ViewerEvent::Detached);
                                 return Err(SourceError::Unavailable(
                                     "session connect failed".into(),
                                 ));
                             }
                             State::Connecting => {
                                 if watch.changed().await.is_err() {
-                                    let _ = self
-                                        .inner
-                                        .viewer_tx
-                                        .send(ViewerEvent::Detached)
-                                        .await;
+                                    let _ = self.inner.viewer_tx.send(ViewerEvent::Detached);
                                     return Err(SourceError::Unavailable(
                                         "supervisor shut down".into(),
                                     ));
@@ -369,7 +365,10 @@ async fn reconnect_watchdog(
     }
 }
 
-async fn viewer_event_loop(inner: Arc<SupervisorInner>, mut rx: mpsc::Receiver<ViewerEvent>) {
+async fn viewer_event_loop(
+    inner: Arc<SupervisorInner>,
+    mut rx: mpsc::UnboundedReceiver<ViewerEvent>,
+) {
     let mut idle_timer: Option<tokio::task::JoinHandle<()>> = None;
     while let Some(ev) = rx.recv().await {
         let count = match ev {

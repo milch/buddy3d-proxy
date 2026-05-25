@@ -40,12 +40,14 @@ pub struct Subscription {
     pub h264: H264Params,
     pub rtp: broadcast::Receiver<RtpPacket>,
     /// Sent on Drop so the supervisor knows the viewer left.
-    pub on_drop: tokio::sync::mpsc::Sender<ViewerEvent>,
+    pub on_drop: tokio::sync::mpsc::UnboundedSender<ViewerEvent>,
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let _ = self.on_drop.try_send(ViewerEvent::Detached);
+        // Unbounded so a sync Drop can always deliver. A bounded try_send
+        // could fail under heavy reconnect churn, leaking the viewer count.
+        let _ = self.on_drop.send(ViewerEvent::Detached);
     }
 }
 

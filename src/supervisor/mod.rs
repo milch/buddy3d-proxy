@@ -33,10 +33,10 @@ pub enum State {
 /// real WebRTC + signaling stack.
 #[async_trait::async_trait]
 pub trait StreamFactory: Send + Sync + 'static {
-    /// Bring up a new WebRTC + signaling session. Returns the negotiated H.264
-    /// params and a broadcast sender that the factory keeps populating with
-    /// inbound RTP packets until told to stop. The returned `StopHandle` is
-    /// dropped to tear the session down.
+    /// Bring up a connected WebRTC + signaling session with negotiated H.264.
+    /// Receiving an SDP offer alone is not success: connection failures must
+    /// return Err so they spend retry budget. Populates `rtp_tx` with inbound
+    /// RTP until the returned `StopHandle` is dropped to tear the session down.
     async fn connect(
         &self,
         rtp_tx: broadcast::Sender<RtpPacket>,
@@ -164,7 +164,6 @@ impl Supervisor {
     pub fn state_changes(&self) -> tokio::sync::watch::Receiver<State> {
         self.inner.state_watch.subscribe()
     }
-
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -207,25 +206,27 @@ impl StreamSource for Supervisor {
                     // viewers' subscribe() calls if they race.
                     drop(state);
 
-                    let (h264_params, stop, broadcast_tx, ended) = match connect_session(&self.inner).await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            // Reset to Idle so any viewers waiting in the
-                            // Connecting arm below see the failure and bail
-                            // out instead of hanging on an empty h264 cell.
-                            let mut s = self.inner.state.lock().await;
-                            if matches!(s.state, State::Connecting) {
-                                s.state = State::Idle;
-                                let _ = self.inner.state_watch.send(State::Idle);
+                    let (h264_params, stop, broadcast_tx, ended) =
+                        match connect_session(&self.inner).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                // Reset to Idle so any viewers waiting in the
+                                // Connecting arm below see the failure and bail
+                                // out instead of hanging on an empty h264 cell.
+                                let mut s = self.inner.state.lock().await;
+                                if matches!(s.state, State::Connecting) {
+                                    s.state = State::Idle;
+                                    let _ = self.inner.state_watch.send(State::Idle);
+                                }
+                                drop(s);
+                                // Roll back the viewer count via the event loop —
+                                // it owns the canonical fetch_sub.
+                                let _ = self.inner.viewer_tx.send(ViewerEvent::Detached);
+                                *self.inner.last_error_at.lock().await =
+                                    Some(std::time::Instant::now());
+                                return Err(e);
                             }
-                            drop(s);
-                            // Roll back the viewer count via the event loop —
-                            // it owns the canonical fetch_sub.
-                            let _ = self.inner.viewer_tx.send(ViewerEvent::Detached);
-                            *self.inner.last_error_at.lock().await = Some(std::time::Instant::now());
-                            return Err(e);
-                        }
-                    };
+                        };
                     *self.inner.session_started_at.lock().await = Some(std::time::Instant::now());
 
                     let mut state = self.inner.state.lock().await;
@@ -301,7 +302,15 @@ impl StreamSource for Supervisor {
 
 async fn connect_session(
     inner: &Arc<SupervisorInner>,
-) -> Result<(H264Params, StopHandle, broadcast::Sender<RtpPacket>, SessionEnded), SourceError> {
+) -> Result<
+    (
+        H264Params,
+        StopHandle,
+        broadcast::Sender<RtpPacket>,
+        SessionEnded,
+    ),
+    SourceError,
+> {
     let (broadcast_tx, _) = broadcast::channel::<RtpPacket>(256);
     let (h264, stop, ended) = budgeted_connect(inner, broadcast_tx.clone()).await?;
     Ok((h264, stop, broadcast_tx, ended))
@@ -356,12 +365,16 @@ async fn reconnect_watchdog(
             );
             tokio::time::sleep(delay).await;
 
-            // If teardown happened during the sleep (viewers left and idle timer fired),
-            // state will be Idle. A fresh subscribe() will have spawned its own watchdog;
-            // this stale one should exit cleanly.
+            // Each initial subscription creates a new broadcast channel. Its
+            // identity distinguishes our session from a later one, even if
+            // teardown and a fresh subscribe both happened during the sleep.
             {
                 let state = inner.state.lock().await;
-                if !matches!(state.state, State::Streaming | State::Connecting) {
+                if !state
+                    .rtp_tx
+                    .as_ref()
+                    .is_some_and(|tx| tx.same_channel(&broadcast_tx))
+                {
                     return;
                 }
             }
@@ -383,9 +396,13 @@ async fn reconnect_watchdog(
             match budgeted_connect(&inner, broadcast_tx.clone()).await {
                 Ok((_h264, stop, new_ended)) => {
                     let mut state = inner.state.lock().await;
-                    // Defensive: if teardown ran between our sleep and our connect,
-                    // a fresh subscribe() will own the new session. Drop ours and exit.
-                    if matches!(state.state, State::Idle) {
+                    // Connecting can outlast teardown too. Never replace the
+                    // stop handle of a newer session with this stale result.
+                    if !state
+                        .rtp_tx
+                        .as_ref()
+                        .is_some_and(|tx| tx.same_channel(&broadcast_tx))
+                    {
                         return;
                     }
                     state.stop = Some(stop);
@@ -482,9 +499,7 @@ mod tests {
                     packetization_mode: 1,
                     payload_type: 96,
                 },
-                StopHandle {
-                    kill: Box::new(()),
-                },
+                StopHandle { kill: Box::new(()) },
                 rx,
             ))
         }
@@ -576,9 +591,7 @@ mod tests {
                     packetization_mode: 1,
                     payload_type: 96,
                 },
-                StopHandle {
-                    kill: Box::new(()),
-                },
+                StopHandle { kill: Box::new(()) },
                 rx,
             ))
         }
@@ -592,7 +605,13 @@ mod tests {
             connects: connects.clone(),
             fire_after: fire.clone(),
         });
-        let sup = Supervisor::new(factory, "Cam".into(), "cam".into(), Duration::from_secs(60), None);
+        let sup = Supervisor::new(
+            factory,
+            "Cam".into(),
+            "cam".into(),
+            Duration::from_secs(60),
+            None,
+        );
         let _sub = sup.subscribe().await.unwrap();
         // Let the watchdog task be polled and reach `ended.await`.
         tokio::task::yield_now().await;
@@ -718,7 +737,10 @@ mod tests {
 
         let r1 = h1.await.expect("subscribe #1 task panicked");
         let r2 = h2.await.expect("subscribe #2 task panicked");
-        assert!(r1.is_err(), "first subscribe should propagate connect error");
+        assert!(
+            r1.is_err(),
+            "first subscribe should propagate connect error"
+        );
         assert!(r2.is_err(), "second subscribe should fail too, not panic");
         assert_eq!(
             connects.load(Ordering::SeqCst),
@@ -749,7 +771,13 @@ mod tests {
         let factory = Arc::new(FailingFactory {
             connects: connects.clone(),
         });
-        let sup = Supervisor::new(factory, "Cam".into(), "cam".into(), Duration::from_secs(60), None);
+        let sup = Supervisor::new(
+            factory,
+            "Cam".into(),
+            "cam".into(),
+            Duration::from_secs(60),
+            None,
+        );
 
         for _ in 0..crate::reconnect_budget::DEFAULT_CAPACITY {
             assert!(sup.subscribe().await.is_err());
@@ -806,7 +834,13 @@ mod tests {
             connects: connects.clone(),
             fire: fire.clone(),
         });
-        let sup = Supervisor::new(factory, "Cam".into(), "cam".into(), Duration::from_secs(60), None);
+        let sup = Supervisor::new(
+            factory,
+            "Cam".into(),
+            "cam".into(),
+            Duration::from_secs(60),
+            None,
+        );
         let _sub = sup.subscribe().await.unwrap();
         tokio::task::yield_now().await;
         fire.lock().await.take().unwrap().send(()).unwrap();

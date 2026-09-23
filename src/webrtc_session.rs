@@ -176,7 +176,9 @@ impl WebRtcSession {
         //      Streaming forever while no media flows.
         let (pc_terminated_tx, pc_terminated_rx) = tokio::sync::oneshot::channel::<()>();
         let pc_terminated_tx = Arc::new(std::sync::Mutex::new(Some(pc_terminated_tx)));
-        let pc_for_state = pc.clone();
+        // Weak: the PC owns this callback, so a strong ref would keep the PC
+        // alive forever.
+        let pc_for_state = Arc::downgrade(&pc);
         let pc_terminated_tx_cb = pc_terminated_tx.clone();
         pc.on_peer_connection_state_change(Box::new(move |state| {
             let pc = pc_for_state.clone();
@@ -185,6 +187,7 @@ impl WebRtcSession {
                 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
                 match state {
                     RTCPeerConnectionState::Connected => {
+                        let Some(pc) = pc.upgrade() else { return };
                         let pair = pc.sctp().transport().ice_transport().get_selected_candidate_pair().await;
                         if let Some(pair) = pair {
                             let local_kind = describe_candidate_type(pair.local.typ);

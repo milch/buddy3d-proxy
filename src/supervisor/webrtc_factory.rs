@@ -16,6 +16,10 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use webrtc::rtp::packet::Packet as RtpPacket;
 
+/// Upper bound on `RTCPeerConnection::close()` so a wedged close can't pin
+/// the driver task forever.
+const PC_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct WebRtcFactory {
     pub orch: Arc<AuthOrchestrator>,
     pub prusa: PrusaClient,
@@ -87,19 +91,22 @@ impl StreamFactory for WebRtcFactory {
         // signaling channel closes, or the peer connection reaches a
         // terminal state (ICE failure that did NOT close signaling — without
         // this arm the supervisor stays at Streaming indefinitely after a
-        // mid-stream ICE drop).
-        let driver_handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = run_session(signaling, &driver_session, signal_tx, signal_rx) => {
-                    let _ = ended_tx.send(());
-                }
-                _ = &mut pc_terminated_rx => {
-                    let _ = driver_session.close().await;
-                    let _ = ended_tx.send(());
-                }
-                _ = &mut kill_rx => {
-                    let _ = driver_session.close().await;
-                }
+        // mid-stream ICE drop). Every exit closes the peer connection: its
+        // state callback keeps it alive, so an unclosed PC leaks its ICE/DTLS
+        // tasks forever.
+        tokio::spawn(async move {
+            let ended_on_its_own = tokio::select! {
+                _ = run_session(signaling, &driver_session, signal_tx, signal_rx) => true,
+                _ = &mut pc_terminated_rx => true,
+                _ = &mut kill_rx => false,
+            };
+            match tokio::time::timeout(PC_CLOSE_TIMEOUT, driver_session.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "peer connection close failed"),
+                Err(_) => tracing::warn!("peer connection close timed out"),
+            }
+            if ended_on_its_own {
+                let _ = ended_tx.send(());
             }
         });
 
@@ -135,6 +142,37 @@ impl StreamFactory for WebRtcFactory {
             tracing::info!(received, delivered, "rtp forwarder ended");
         });
 
+        // Teardown for the StopHandle. Built before the SDP wait so an early
+        // return below tears the session down too.
+        struct Joiner {
+            kill: Option<oneshot::Sender<()>>,
+            forwarder: tokio::task::JoinHandle<()>,
+            live_outbound: crate::live_outbound::LiveOutbound,
+        }
+        impl Drop for Joiner {
+            fn drop(&mut self) {
+                // Don't abort the driver: kill lets it close the peer
+                // connection on its way out.
+                if let Some(tx) = self.kill.take() {
+                    let _ = tx.send(());
+                }
+                self.forwarder.abort();
+                // Clear the live outbound registry. The Drop runs synchronously
+                // on whatever thread held the StopHandle, so we hand the
+                // clear-op to a tokio task to avoid blocking on the Mutex.
+                let live = self.live_outbound.clone();
+                tokio::spawn(async move {
+                    let mut guard = live.lock().await;
+                    *guard = None;
+                });
+            }
+        }
+        let joiner = Joiner {
+            kill: Some(kill_tx),
+            forwarder: forwarder_handle,
+            live_outbound: self.live_outbound.clone(),
+        };
+
         // Poll for the negotiated remote SDP — `handle_signal` calls
         // `set_remote_description` on the SDP-offer event, so we wait up to
         // 15s for it to appear.
@@ -151,37 +189,6 @@ impl StreamFactory for WebRtcFactory {
         let h264 = h264.ok_or_else(|| {
             SourceError::Unavailable("no H.264 params in remote SDP after 15s".into())
         })?;
-
-        // Bundle both task handles into the StopHandle. Drop = abort = teardown.
-        struct Joiner {
-            kill: Option<oneshot::Sender<()>>,
-            forwarder: tokio::task::JoinHandle<()>,
-            driver: tokio::task::JoinHandle<()>,
-            live_outbound: crate::live_outbound::LiveOutbound,
-        }
-        impl Drop for Joiner {
-            fn drop(&mut self) {
-                if let Some(tx) = self.kill.take() {
-                    let _ = tx.send(());
-                }
-                self.forwarder.abort();
-                self.driver.abort();
-                // Clear the live outbound registry. The Drop runs synchronously
-                // on whatever thread held the StopHandle, so we hand the
-                // clear-op to a tokio task to avoid blocking on the Mutex.
-                let live = self.live_outbound.clone();
-                tokio::spawn(async move {
-                    let mut guard = live.lock().await;
-                    *guard = None;
-                });
-            }
-        }
-        let joiner = Joiner {
-            kill: Some(kill_tx),
-            forwarder: forwarder_handle,
-            driver: driver_handle,
-            live_outbound: self.live_outbound.clone(),
-        };
 
         Ok((
             h264,

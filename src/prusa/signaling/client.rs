@@ -31,15 +31,23 @@ pub enum Outbound {
 pub enum Inbound {
     /// The Socket.IO server acknowledged our CONNECT and assigned a `sid`.
     /// We need this sid to populate `WebRtcSignal.session_id` on the kick-off.
-    Connected { sid: Option<String> },
+    Connected {
+        sid: Option<String>,
+    },
     Disconnected,
     /// Server sent a binary event with attachments. We deliver a single attachment
     /// because every observed Prusa event uses exactly one.
-    BinaryEvent { name: String, payload: Bytes },
+    BinaryEvent {
+        name: String,
+        payload: Bytes,
+    },
     /// Server ACK'd one of our `emitWithAck` events. Used to gate follow-up
     /// emits until the auth flow is complete (otherwise the server returns
     /// `ClientIsNotSessionMemberError` for any event that races the auth ACK).
-    Ack { id: u64, payload: Vec<serde_json::Value> },
+    Ack {
+        id: u64,
+        payload: Vec<serde_json::Value>,
+    },
     /// Underlying transport closed unexpectedly.
     TransportClosed(String),
 }
@@ -122,6 +130,12 @@ pub async fn connect(
         ping_timer.tick().await;
         let mut next_ack_id: u64 = 0;
 
+        // Event consumption owns this transport's lifetime. Outbound clones
+        // (for example, the command dispatcher) must not keep it alive after
+        // the session ends, even during a blocked WebSocket write.
+        tokio::select! {
+            _ = inbound_tx.closed() => {},
+            _ = async {
         loop {
             tokio::select! {
                 msg = stream.next() => {
@@ -251,6 +265,8 @@ pub async fn connect(
                     break;
                 }
             }
+        }
+            } => {},
         }
     });
 

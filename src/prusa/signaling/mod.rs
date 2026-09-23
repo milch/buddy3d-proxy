@@ -20,7 +20,10 @@ pub enum SignalingEvent {
     Features(crate::proto::Features),
     WebRtc(crate::proto::WebRtcSignal),
     /// An event we don't handle (logged, surfaced as raw bytes).
-    Unknown { name: String, payload: Bytes },
+    Unknown {
+        name: String,
+        payload: Bytes,
+    },
     Closed(String),
 }
 
@@ -72,10 +75,32 @@ impl PrusaSignaling {
         camera_token: String,
         access_jwt: String,
         webrtc_cfg: crate::prusa::api::WebRtcConfig,
-        status_sink: Option<std::sync::Arc<tokio::sync::watch::Sender<Option<crate::proto::Status>>>>,
+        status_sink: Option<
+            std::sync::Arc<tokio::sync::watch::Sender<Option<crate::proto::Status>>>,
+        >,
     ) -> Result<Self, SignalingError> {
-        let (outbound, mut raw_events) = client::connect(SIGNALING_URL).await?;
+        let (outbound, raw_events) = client::connect(SIGNALING_URL).await?;
+        Self::from_transport(
+            outbound,
+            raw_events,
+            camera_token,
+            access_jwt,
+            webrtc_cfg,
+            status_sink,
+        )
+        .await
+    }
 
+    async fn from_transport(
+        outbound: mpsc::Sender<Outbound>,
+        mut raw_events: mpsc::Receiver<Inbound>,
+        camera_token: String,
+        access_jwt: String,
+        webrtc_cfg: crate::prusa::api::WebRtcConfig,
+        status_sink: Option<
+            std::sync::Arc<tokio::sync::watch::Sender<Option<crate::proto::Status>>>,
+        >,
+    ) -> Result<Self, SignalingError> {
         // Send Engine.IO MESSAGE → Socket.IO CONNECT (`40{...}`) with the
         // camera's token. The signaling server validates this against the
         // tokens it knows about.
@@ -109,6 +134,11 @@ impl PrusaSignaling {
         let (typed_tx, typed_rx) = mpsc::channel::<SignalingEvent>(64);
         let outbound_for_auth = outbound.clone();
         tokio::spawn(async move {
+            // Cancel the entire translator, including any blocked outbound
+            // send, when the session no longer consumes its events.
+            tokio::select! {
+                _ = typed_tx.closed() => {},
+                _ = async {
             // We're already past the Socket.IO CONNECT ack (synchronously
             // captured above); send `client_authentication` straight away.
             let auth = crate::proto::ClientAuthentication {
@@ -214,6 +244,8 @@ impl PrusaSignaling {
                     return;
                 }
             }
+                } => {},
+            }
         });
 
         Ok(Self {
@@ -274,7 +306,7 @@ impl PrusaSignaling {
 /// the signaling server expects in the kick-off. Each REST entry typically has
 /// 1 username/credential pair plus N URLs; we group them as one IceServerGroup.
 fn build_ice_config(cfg: &crate::prusa::api::WebRtcConfig) -> crate::proto::IceConfig {
-    use crate::proto::{IceConfig, IceServer, IceServerGroup};
+    use crate::proto::{IceConfig, IceServerGroup};
     let server_groups = cfg
         .ice_servers
         .iter()
@@ -363,6 +395,152 @@ fn translate_binary(name: &str, payload: Bytes) -> SignalingEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config() -> crate::prusa::api::WebRtcConfig {
+        crate::prusa::api::WebRtcConfig {
+            ice_servers: vec![],
+            ttl_seconds: 300,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn dropping_signaling_stops_translator_without_another_event() {
+        let (outbound, mut outbound_rx) = mpsc::channel(8);
+        let (raw_tx, raw_rx) = mpsc::channel(8);
+        raw_tx
+            .send(Inbound::Connected {
+                sid: Some("test".into()),
+            })
+            .await
+            .unwrap();
+        let signaling = PrusaSignaling::from_transport(
+            outbound,
+            raw_rx,
+            "camera".into(),
+            "jwt".into(),
+            config(),
+            None,
+        )
+        .await
+        .unwrap();
+        // Observe CONNECT and authentication so the translator is waiting for
+        // the server, rather than relying on a particular task schedule.
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(Outbound::Connect(_))
+        ));
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(Outbound::BinaryEvent { .. })
+        ));
+        drop(signaling);
+        tokio::time::timeout(std::time::Duration::from_secs(1), raw_tx.closed())
+            .await
+            .expect("translator retained its transport receiver after session drop");
+        assert!(outbound_rx.recv().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn dropping_signaling_cancels_a_blocked_auth_send() {
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let (raw_tx, raw_rx) = mpsc::channel(8);
+        raw_tx
+            .send(Inbound::Connected {
+                sid: Some("test".into()),
+            })
+            .await
+            .unwrap();
+        let signaling = PrusaSignaling::from_transport(
+            outbound,
+            raw_rx,
+            "camera".into(),
+            "jwt".into(),
+            config(),
+            None,
+        )
+        .await
+        .unwrap();
+        // CONNECT filled the only slot; authentication cannot be sent.
+        tokio::task::yield_now().await;
+        drop(signaling);
+        tokio::time::timeout(std::time::Duration::from_secs(1), raw_tx.closed())
+            .await
+            .expect("translator remained blocked sending auth after session drop");
+    }
+
+    #[tokio::test]
+    async fn dropping_signaling_closes_heartbeat_transport_with_outbound_clone() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "ws://{}/socket.io/?EIO=4&transport=websocket",
+            listener.local_addr().unwrap()
+        );
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(Message::Text(
+                r#"0{"sid":"engine","upgrades":[],"pingInterval":50,"pingTimeout":5000}"#.into(),
+            ))
+            .await
+            .unwrap();
+            let mut ready_tx = Some(ready_tx);
+            let mut auth = false;
+            let mut ping = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    message = ws.next() => match message {
+                        Some(Ok(Message::Text(t))) if t.starts_with("40") => {
+                            ws.send(Message::Text(r#"40{"sid":"socket"}"#.into())).await.unwrap();
+                        }
+                        Some(Ok(Message::Binary(_))) if !auth => {
+                            auth = true;
+                            ws.send(Message::Text("430[0]".into())).await.unwrap();
+                        }
+                        Some(Ok(Message::Text(t))) if t == "3" && auth => {
+                            if let Some(tx) = ready_tx.take() { let _ = tx.send(()); }
+                        }
+                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                        _ => {}
+                    },
+                    _ = ping.tick() => {
+                        if ws.send(Message::Text("2".into())).await.is_err() { return; }
+                    }
+                }
+            }
+        });
+        let (outbound, raw_rx) = client::connect(&endpoint).await.unwrap();
+        let signaling = PrusaSignaling::from_transport(
+            outbound,
+            raw_rx,
+            "camera".into(),
+            "jwt".into(),
+            config(),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // The command dispatcher may retain an outbound clone during teardown.
+        let retained_outbound = signaling.outbound.clone();
+        drop(signaling);
+        let closed = tokio::time::timeout(Duration::from_secs(1), retained_outbound.closed()).await;
+        if closed.is_err() {
+            server.abort();
+        }
+        closed.expect("heartbeat-only signaling transport survived session drop");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn translate_binary_decodes_status() {

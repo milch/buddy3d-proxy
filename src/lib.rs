@@ -9,6 +9,7 @@ pub mod pkce;
 pub mod prusa;
 pub mod proto;
 pub mod rate_limit;
+pub mod reconnect_budget;
 pub mod rtsp;
 pub mod snapshot;
 pub mod supervisor;

@@ -26,6 +26,8 @@ pub async fn run(
             wss_reconnects_total = snap.wss_reconnects_total,
             prusa_5xx_bucket_now = bucket_now,
             prusa_5xx_bucket_cap = bucket_cap,
+            reconnect_bucket_now = snap.reconnect_tokens,
+            reconnect_bucket_cap = snap.reconnect_tokens_cap,
             last_error_age_s = snap.last_error_age_secs,
             session_uptime_s = snap.session_uptime_secs,
             "metrics"

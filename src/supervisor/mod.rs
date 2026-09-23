@@ -7,6 +7,7 @@
 
 pub mod webrtc_factory;
 
+use crate::reconnect_budget::ReconnectBudget;
 use crate::rtsp::sdp::H264Params;
 use crate::rtsp::server::{SourceError, StreamSource, Subscription, ViewerEvent};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -67,6 +68,9 @@ struct SupervisorInner {
     pub wss_reconnects_total: std::sync::atomic::AtomicU64,
     pub last_error_at: Mutex<Option<std::time::Instant>>,
     pub session_started_at: Mutex<Option<std::time::Instant>>,
+    /// Long-run pacing for `factory.connect()` calls from both `subscribe()`
+    /// and the watchdog. Never held across an await.
+    reconnect_budget: std::sync::Mutex<ReconnectBudget>,
     /// When `Some`, the watchdog observes this watch and exits cleanly once
     /// it flips to `true` — used by the auth orchestrator to signal that
     /// further reconnect attempts will keep failing with `LoginRejected`.
@@ -113,6 +117,7 @@ impl Supervisor {
             wss_reconnects_total: std::sync::atomic::AtomicU64::new(0),
             last_error_at: Mutex::new(None),
             session_started_at: Mutex::new(None),
+            reconnect_budget: std::sync::Mutex::new(ReconnectBudget::default()),
             failed_rx,
             state_watch,
         });
@@ -130,7 +135,13 @@ impl Supervisor {
         let state = self.inner.state.lock().await;
         let session_started_at = *self.inner.session_started_at.lock().await;
         let last_error_at = *self.inner.last_error_at.lock().await;
+        let (reconnect_tokens, reconnect_tokens_cap) = {
+            let mut budget = self.inner.reconnect_budget.lock().unwrap();
+            (budget.tokens(), budget.capacity())
+        };
         SupervisorSnapshot {
+            reconnect_tokens,
+            reconnect_tokens_cap,
             state: state.state,
             viewers: self.inner.viewer_count.load(Ordering::SeqCst).max(0) as u32,
             wss_reconnects_total: self.inner.wss_reconnects_total.load(Ordering::SeqCst),
@@ -163,6 +174,8 @@ pub struct SupervisorSnapshot {
     pub wss_reconnects_total: u64,
     pub session_uptime_secs: Option<u64>,
     pub last_error_age_secs: Option<u64>,
+    pub reconnect_tokens: u32,
+    pub reconnect_tokens_cap: u32,
 }
 
 #[async_trait::async_trait]
@@ -177,6 +190,17 @@ impl StreamSource for Supervisor {
             let mut state = self.inner.state.lock().await;
             match state.state {
                 State::Idle => {
+                    // Out of reconnect budget: fail this viewer fast rather
+                    // than parking its RTSP request for minutes.
+                    let wait = self.inner.reconnect_budget.lock().unwrap().wait_time();
+                    if !wait.is_zero() {
+                        drop(state);
+                        let _ = self.inner.viewer_tx.send(ViewerEvent::Detached);
+                        return Err(SourceError::Unavailable(format!(
+                            "reconnect budget exhausted; next attempt allowed in {}s",
+                            wait.as_secs()
+                        )));
+                    }
                     state.state = State::Connecting;
                     let _ = self.inner.state_watch.send(State::Connecting);
                     // Drop the lock while we connect — we don't want to block other
@@ -279,8 +303,23 @@ async fn connect_session(
     inner: &Arc<SupervisorInner>,
 ) -> Result<(H264Params, StopHandle, broadcast::Sender<RtpPacket>, SessionEnded), SourceError> {
     let (broadcast_tx, _) = broadcast::channel::<RtpPacket>(256);
-    let (h264, stop, ended) = inner.factory.connect(broadcast_tx.clone()).await?;
+    let (h264, stop, ended) = budgeted_connect(inner, broadcast_tx.clone()).await?;
     Ok((h264, stop, broadcast_tx, ended))
+}
+
+/// `factory.connect()` with the outcome charged to the reconnect budget.
+async fn budgeted_connect(
+    inner: &Arc<SupervisorInner>,
+    rtp_tx: broadcast::Sender<RtpPacket>,
+) -> Result<(H264Params, StopHandle, SessionEnded), SourceError> {
+    let result = inner.factory.connect(rtp_tx).await;
+    let mut budget = inner.reconnect_budget.lock().unwrap();
+    match &result {
+        Ok(_) => budget.record_success(),
+        Err(_) => budget.record_failure(),
+    }
+    tracing::debug!(tokens = budget.tokens(), "reconnect budget updated");
+    result
 }
 
 async fn reconnect_watchdog(
@@ -305,10 +344,14 @@ async fn reconnect_watchdog(
 
         // Retry loop: keep trying until success OR all viewers leave.
         loop {
-            let delay = backoff.next_delay();
+            // ExpBackoff spaces out a burst of retries; the budget stretches
+            // the gap to its refill period once the burst is spent.
+            let budget_wait = inner.reconnect_budget.lock().unwrap().wait_time();
+            let delay = backoff.next_delay().max(budget_wait);
             tracing::warn!(
                 attempt = backoff.attempt(),
                 delay_ms = delay.as_millis() as u64,
+                budget_exhausted = !budget_wait.is_zero(),
                 "session ended; backing off before reconnect"
             );
             tokio::time::sleep(delay).await;
@@ -337,7 +380,7 @@ async fn reconnect_watchdog(
                 }
             }
 
-            match inner.factory.connect(broadcast_tx.clone()).await {
+            match budgeted_connect(&inner, broadcast_tx.clone()).await {
                 Ok((_h264, stop, new_ended)) => {
                     let mut state = inner.state.lock().await;
                     // Defensive: if teardown ran between our sleep and our connect,
@@ -682,6 +725,100 @@ mod tests {
             1,
             "only one connect attempt should have been made"
         );
+    }
+
+    /// Always fails to connect, like a camera that rejects every session.
+    struct FailingFactory {
+        connects: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFactory for FailingFactory {
+        async fn connect(
+            &self,
+            _rtp_tx: broadcast::Sender<RtpPacket>,
+        ) -> Result<(H264Params, StopHandle, SessionEnded), SourceError> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Err(SourceError::Unavailable("camera offline".into()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscribe_fails_fast_once_reconnect_budget_is_spent() {
+        let connects = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(FailingFactory {
+            connects: connects.clone(),
+        });
+        let sup = Supervisor::new(factory, "Cam".into(), "cam".into(), Duration::from_secs(60), None);
+
+        for _ in 0..crate::reconnect_budget::DEFAULT_CAPACITY {
+            assert!(sup.subscribe().await.is_err());
+        }
+        assert_eq!(connects.load(Ordering::SeqCst), 10);
+
+        // Budget spent: rejected without touching the factory.
+        assert!(sup.subscribe().await.is_err());
+        assert_eq!(connects.load(Ordering::SeqCst), 10);
+
+        // One refill period later, one more attempt is allowed.
+        tokio::time::advance(crate::reconnect_budget::DEFAULT_REFILL_PERIOD).await;
+        assert!(sup.subscribe().await.is_err());
+        assert!(sup.subscribe().await.is_err());
+        assert_eq!(connects.load(Ordering::SeqCst), 11);
+    }
+
+    /// First connect succeeds and hands its ended-tx to the test; every
+    /// later connect fails.
+    struct FailsAfterFirstFactory {
+        connects: Arc<AtomicUsize>,
+        fire: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFactory for FailsAfterFirstFactory {
+        async fn connect(
+            &self,
+            _rtp_tx: broadcast::Sender<RtpPacket>,
+        ) -> Result<(H264Params, StopHandle, SessionEnded), SourceError> {
+            if self.connects.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Err(SourceError::Unavailable("camera offline".into()));
+            }
+            let (tx, rx) = oneshot::channel();
+            *self.fire.lock().await = Some(tx);
+            Ok((
+                H264Params {
+                    profile_level_id: "42c01e".into(),
+                    sprop_parameter_sets: "Z0L,aM4".into(),
+                    packetization_mode: 1,
+                    payload_type: 96,
+                },
+                StopHandle { kill: Box::new(()) },
+                rx,
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn watchdog_slows_to_refill_rate_once_budget_is_spent() {
+        let connects = Arc::new(AtomicUsize::new(0));
+        let fire = Arc::new(Mutex::new(None));
+        let factory = Arc::new(FailsAfterFirstFactory {
+            connects: connects.clone(),
+            fire: fire.clone(),
+        });
+        let sup = Supervisor::new(factory, "Cam".into(), "cam".into(), Duration::from_secs(60), None);
+        let _sub = sup.subscribe().await.unwrap();
+        tokio::task::yield_now().await;
+        fire.lock().await.take().unwrap().send(()).unwrap();
+
+        // The initial success tops the bucket up to 10 (already full). Ten
+        // failed retries at ExpBackoff pace (≤ ~220s with jitter) empty it,
+        // the refill clock having started at the first failure (~1s in).
+        // The next token arrives ~301s in; the one after ~601s. So in 590s we
+        // expect: 1 initial + 10 burst + 1 refilled = 12. Without the budget
+        // a 30s-capped backoff would have made ~25 attempts.
+        tokio::time::sleep(Duration::from_secs(590)).await;
+        assert_eq!(connects.load(Ordering::SeqCst), 12);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

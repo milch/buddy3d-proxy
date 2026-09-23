@@ -210,8 +210,19 @@ async fn forward_rtp(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut frame_buf = BytesMut::with_capacity(2048);
     let mut serialize_buf = Vec::with_capacity(2048);
+    let mut discard = [0u8; 4096];
     loop {
-        match rtp_rx.recv().await {
+        // Watch the socket too: when the camera is down no RTP arrives, so no
+        // write ever fails, and without a read we'd never see the client hang
+        // up. Inbound bytes (RTCP, keepalives) are discarded.
+        let recv = tokio::select! {
+            recv = rtp_rx.recv() => recv,
+            read = stream.read(&mut discard) => match read {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(_) => continue,
+            },
+        };
+        match recv {
             Ok(pkt) => {
                 serialize_buf.clear();
                 let header = pkt.header.clone();
@@ -283,6 +294,78 @@ fn header_to_bytes(h: &webrtc::rtp::header::Header) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Source whose RTP stream never produces a packet, like a camera that's
+    /// down while the supervisor still reports Streaming.
+    struct SilentSource {
+        on_drop: tokio::sync::mpsc::UnboundedSender<ViewerEvent>,
+        rtp_tx: broadcast::Sender<RtpPacket>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamSource for SilentSource {
+        async fn subscribe(&self) -> Result<Subscription, SourceError> {
+            Ok(Subscription {
+                h264: H264Params {
+                    profile_level_id: "42c01e".into(),
+                    sprop_parameter_sets: "Z0L,aM4".into(),
+                    packetization_mode: 1,
+                    payload_type: 96,
+                },
+                rtp: self.rtp_tx.subscribe(),
+                on_drop: self.on_drop.clone(),
+            })
+        }
+        fn camera_name(&self) -> &str {
+            "Cam"
+        }
+        fn rtsp_path(&self) -> &str {
+            "cam"
+        }
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_while_streaming_without_rtp_releases_subscription() {
+        let (on_drop, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (rtp_tx, _) = broadcast::channel(16);
+        let source = Arc::new(SilentSource { on_drop, rtp_tx });
+        let handle = Server::start("127.0.0.1", 0, source.clone()).await.unwrap();
+
+        let mut client = TcpStream::connect(handle.bound_addr).await.unwrap();
+        client
+            .write_all(
+                b"DESCRIBE rtsp://h/cam RTSP/1.0\r\nCSeq: 1\r\n\r\n\
+                  SETUP rtsp://h/cam/streamid=0 RTSP/1.0\r\nCSeq: 2\r\n\
+                  Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n\
+                  PLAY rtsp://h/cam RTSP/1.0\r\nCSeq: 3\r\nSession: BUDDY3D-0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        // Wait for the PLAY response so the server is inside forward_rtp.
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !String::from_utf8_lossy(&got).contains("Range: npt") {
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+                .await
+                .expect("timed out waiting for PLAY response")
+                .unwrap();
+            assert_ne!(n, 0, "server closed before PLAY response");
+            got.extend_from_slice(&buf[..n]);
+        }
+
+        drop(client);
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("subscription not released after client disconnect");
+        assert!(matches!(ev, Some(ViewerEvent::Detached)));
+        // Keep the RTP sender alive until here so Closed can't end the stream.
+        drop(source);
+    }
+
     #[test]
     fn header_serializer_minimal_round_trip_shape() {
         use super::header_to_bytes;
